@@ -1,2 +1,10 @@
 # GuessNumberPro
-猜数字游戏 GuessNumberPro  一个基于 Python 的猜数字小游戏。
+
+猜数字游戏 GuessNumberPro，一个基于 Python 的猜数字小游戏。
+
+## ✨ 功能特点
+- 支持简单、中等、困难、自定义四种难度
+- 实时显示剩余次数和当前范围
+- 自动加密保存历史记录（隐藏+只读）
+- 支持统计对局胜率、平均次数
+- 支持导出记录到 CSV / HTML（WPS可打开）
