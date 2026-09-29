@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+猜数字游戏数据/
+.gg_lock
+*.dat
+*.lock
