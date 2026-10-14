@@ -1,124 +1,54 @@
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-猜数字游戏
-- 数据存放在用户可写目录，不依赖程序所在目录
-- 无防移动锁，文件夹可自由移动/复制
-- 记录文件使用混淆 + HMAC 校验（非强加密，仅防手改）
+猜数字游戏 · Web 版（PC / 手机通用）
+打包：
+    pyinstaller --onefile --name GuessGame --console guess_game_web.py
+运行后浏览器访问 http://127.0.0.1:端口
+同一 Wi-Fi 下手机访问 http://<电脑局域网IP>:端口
 """
 
-import os
-import sys
+import base64
 import csv
-import json
-import math
+import hashlib
 import hmac
 import html
-import base64
+import io
+import json
+import os
 import random
-import hashlib
-import shutil
-import secrets
+import socket
+import sys
 import tempfile
-import unittest
-import ctypes
-from ctypes import wintypes
+import threading
+import uuid
+import webbrowser
 from datetime import datetime
-from typing import TypedDict
-from unittest import mock
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse, parse_qs
 
 
 # ============================================================
-# 类型定义
+# 加密存储（与原版一致：XOR + HMAC）
 # ============================================================
-class GameRecord(TypedDict):
-    win: bool
-    level_name: str
-    answer: int
-    attempts: int
-    max_attempts: int
-    guesses: list
-    time: str
-
-
-# ============================================================
-# 常量
-# ============================================================
-LEVELS = {
-    "1": {"name": "简单", "max_num": 1000, "max_attempts": 20},
-    "2": {"name": "中等", "max_num": 10000, "max_attempts": 30},
-    "3": {"name": "困难", "max_num": 100000, "max_attempts": 40},
-}
-
 SECRET_KEY = "guess_game_secret_key_#2024@secure!"
 
-MAX_BACKUPS = 10
-USE_SINGLE_INSTANCE = True
 
-
-# ============================================================
-# 路径
-# ============================================================
-def get_data_dir() -> str:
-    if os.name == "nt":
-        base = os.environ.get("APPDATA")
-        if not base:
-            base = os.path.expanduser("~")
-    elif sys.platform == "darwin":
-        home = os.path.expanduser("~")
-        base = (
-            os.path.join(home, "Library", "Application Support")
-            if home and home != "~"
-            else ""
-        )
-    else:
-        base = os.environ.get("XDG_DATA_HOME")
-        if not base:
-            home = os.path.expanduser("~")
-            base = (
-                os.path.join(home, ".local", "share")
-                if home and home != "~"
-                else ""
-            )
-
-    if not base or base == "~":
-        base = tempfile.gettempdir()
-    return os.path.join(base, "GuessGame")
-
-
-DATA_DIR = get_data_dir()
-RECORDS_FILE = os.path.join(DATA_DIR, "records.dat")
-EXPORT_DIR = os.path.join(DATA_DIR, "exports")
-BACKUP_DIR = os.path.join(DATA_DIR, "backups")
-LOCK_FILE = os.path.join(DATA_DIR, "instance.lock")
-
-
-def ensure_data_dir() -> None:
-    os.makedirs(DATA_DIR, exist_ok=True)
-    os.makedirs(EXPORT_DIR, exist_ok=True)
-    os.makedirs(BACKUP_DIR, exist_ok=True)
-
-
-# ============================================================
-# 混淆 + HMAC 校验
-# ============================================================
 def _key_bytes() -> bytes:
     return hashlib.sha256(SECRET_KEY.encode("utf-8")).digest()
 
 
-def _xor_bytes(data: bytes, key: bytes) -> bytes:
+def _xor(data: bytes, key: bytes) -> bytes:
     return bytes(b ^ key[i % len(key)] for i, b in enumerate(data))
 
 
-def _make_mac(cipher: bytes) -> str:
+def _mac(cipher: bytes) -> str:
     return hmac.new(_key_bytes(), cipher, hashlib.sha256).hexdigest()
 
 
 def encrypt_text(text: str) -> str:
-    cipher = _xor_bytes(text.encode("utf-8"), _key_bytes())
-    payload = {
-        "c": base64.b64encode(cipher).decode("ascii"),
-        "m": _make_mac(cipher),
-    }
+    cipher = _xor(text.encode("utf-8"), _key_bytes())
+    payload = {"c": base64.b64encode(cipher).decode("ascii"), "m": _mac(cipher)}
     return base64.b64encode(
         json.dumps(payload, ensure_ascii=False).encode("utf-8")
     ).decode("ascii")
@@ -128,1012 +58,932 @@ def decrypt_text(token: str) -> str:
     raw = base64.b64decode(token.encode("ascii"))
     payload = json.loads(raw.decode("utf-8"))
     cipher = base64.b64decode(payload["c"].encode("ascii"))
-    expected = _make_mac(cipher)
-    if not hmac.compare_digest(payload.get("m", ""), expected):
-        raise ValueError("数据校验失败，文件可能被篡改")
-    return _xor_bytes(cipher, _key_bytes()).decode("utf-8")
+    if not hmac.compare_digest(payload.get("m", ""), _mac(cipher)):
+        raise ValueError("数据校验失败")
+    return _xor(cipher, _key_bytes()).decode("utf-8")
 
 
 # ============================================================
-# 备份管理
+# 数据目录
 # ============================================================
-def _cleanup_backups() -> None:
-    """两类备份文件各自保留最近 MAX_BACKUPS 个。
-
-    按文件名排序（文件名内嵌时间戳），比 mtime 更稳定：
-    同一秒内多次备份 mtime 可能相同，文件名末尾有 _1、_2 区分。
-    """
-    try:
-        entries = os.listdir(BACKUP_DIR)
-    except OSError:
-        return
-
-    for prefix in ("records.bak_", "records.corrupt_"):
-        files = [
-            os.path.join(BACKUP_DIR, f)
-            for f in entries
-            if f.startswith(prefix)
-        ]
-        files.sort(key=lambda p: os.path.basename(p), reverse=True)
-        for old in files[MAX_BACKUPS:]:
-            try:
-                os.remove(old)
-            except OSError:
-                pass
+def get_data_dir() -> str:
+    if os.name == "nt":
+        base = os.environ.get("APPDATA") or os.path.expanduser("~")
+    elif sys.platform == "darwin":
+        base = os.path.join(os.path.expanduser("~"),
+                            "Library", "Application Support")
+    else:
+        base = os.environ.get("XDG_DATA_HOME") or \
+               os.path.join(os.path.expanduser("~"), ".local", "share")
+    if not base or base == "~":
+        base = tempfile.gettempdir()
+    return os.path.join(base, "GuessGame")
 
 
-def _backup_corrupt_file(reason: str, quiet: bool = False) -> str:
-    ensure_data_dir()
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+DATA_DIR = get_data_dir()
+RECORDS_FILE = os.path.join(DATA_DIR, "records.dat")
+EXPORT_DIR = os.path.join(DATA_DIR, "exports")
 
-    target = os.path.join(BACKUP_DIR, f"records.bak_{stamp}")
-    counter = 1
-    while os.path.exists(target):
-        target = os.path.join(BACKUP_DIR, f"records.bak_{stamp}_{counter}")
-        counter += 1
 
-    shutil.copyfile(RECORDS_FILE, target)
-    try:
-        os.chmod(target, 0o644)
-    except OSError:
-        pass
-
-    corrupt_path = os.path.join(BACKUP_DIR, f"records.corrupt_{stamp}")
-    counter = 1
-    while os.path.exists(corrupt_path):
-        corrupt_path = os.path.join(
-            BACKUP_DIR, f"records.corrupt_{stamp}_{counter}"
-        )
-        counter += 1
-    try:
-        os.replace(RECORDS_FILE, corrupt_path)
-    except OSError:
-        pass
-
-    _cleanup_backups()
-
-    if not quiet:
-        print("\n" + "!" * 60)
-        print("警告：记录文件无法读取，可能已损坏或被外部修改。")
-        print(f"原因：{reason}")
-        print(f"原文件已移动至：{corrupt_path}")
-        print(f"副本已备份至：  {target}")
-        print("本次启动将以空记录开始。")
-        print("!" * 60)
-    return target
+def ensure_dirs() -> None:
+    os.makedirs(DATA_DIR, exist_ok=True)
+    os.makedirs(EXPORT_DIR, exist_ok=True)
 
 
 # ============================================================
 # 记录读写
 # ============================================================
-def load_records(interactive: bool = True) -> list:
-    """读取记录。
+_records_lock = threading.Lock()
 
-    interactive=False 时，损坏不再阻塞 input()，也不打印警告，
-    用于测试 / 集成。
-    """
+
+def _read_records_unlocked():
     if not os.path.exists(RECORDS_FILE):
         return []
-
     try:
         with open(RECORDS_FILE, "r", encoding="utf-8") as f:
             token = f.read().strip()
         if not token:
             return []
         data = json.loads(decrypt_text(token))
-        if not isinstance(data, list):
-            raise ValueError("记录文件结构异常")
-        return data
-    except Exception as e:
-        _backup_corrupt_file(str(e), quiet=not interactive)
-        if interactive:
-            try:
-                input("按回车继续...")
-            except EOFError:
-                pass
+        return data if isinstance(data, list) else []
+    except Exception:
+        try:
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            bak = os.path.join(DATA_DIR, f"records.corrupt_{stamp}.dat")
+            os.replace(RECORDS_FILE, bak)
+        except OSError:
+            pass
         return []
 
 
-def save_records(records: list) -> bool:
+def _write_records_unlocked(records) -> None:
+    ensure_dirs()
+    token = encrypt_text(json.dumps(records, ensure_ascii=False))
+    fd, tmp = tempfile.mkstemp(prefix="records.", suffix=".tmp", dir=DATA_DIR)
     try:
-        ensure_data_dir()
-        token = encrypt_text(json.dumps(records, ensure_ascii=False))
-
-        fd, tmp_path = tempfile.mkstemp(
-            prefix="records.", suffix=".tmp", dir=DATA_DIR
-        )
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(token)
+        os.replace(tmp, RECORDS_FILE)
+    except Exception:
         try:
-            try:
-                f = os.fdopen(fd, "w", encoding="utf-8")
-            except Exception:
-                # fdopen 失败：fd 还没被接管，自己关掉，避免泄漏
-                try:
-                    os.close(fd)
-                except OSError:
-                    pass
-                raise
-
-            with f:
-                f.write(token)
-
-            os.replace(tmp_path, RECORDS_FILE)
-        except Exception:
-            try:
-                os.remove(tmp_path)
-            except OSError:
-                pass
-            raise
-        return True
-    except OSError as e:
-        print(f"\n[错误] 保存记录失败：{e}")
-        print("本局记录未能写入磁盘，将从内存中回滚，避免退出后丢失。")
-        return False
-
-
-def append_record(records: list, record: GameRecord) -> bool:
-    records.append(record)
-    if not save_records(records):
-        records.pop()
-        return False
-    return True
-
-
-# ============================================================
-# 单实例锁（含陈旧锁检测）
-# ============================================================
-_WIN_KERNEL32 = None  # 缓存 kernel32，避免每次重新声明签名
-
-
-def _get_win_kernel32():
-    """懒加载 kernel32 并显式声明签名。
-
-    默认 restype 是 c_int，64 位 Windows 上 HANDLE 是 64 位，
-    句柄值超过 2^31-1 会被截断成错误值，导致 CloseHandle 拿错句柄。
-    这里显式声明 restype / argtypes，避免截断。
-    """
-    global _WIN_KERNEL32
-    if _WIN_KERNEL32 is None:
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        kernel32.OpenProcess.restype = wintypes.HANDLE
-        kernel32.OpenProcess.argtypes = [
-            wintypes.DWORD,
-            wintypes.BOOL,
-            wintypes.DWORD,
-        ]
-        kernel32.CloseHandle.restype = wintypes.BOOL
-        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-        _WIN_KERNEL32 = kernel32
-    return _WIN_KERNEL32
-
-
-def _is_stale_lock(path: str) -> bool:
-    try:
-        with open(path, "r", encoding="ascii") as f:
-            pid = int(f.read().strip())
-    except (OSError, ValueError):
-        return True
-
-    if pid == os.getpid():
-        return False
-
-    if os.name == "nt":
-        # Windows: 千万不要用 os.kill(pid, 0)！Python 在 Windows 上
-        # 把 sig 直接传给 TerminateProcess，会把无辜进程杀掉。
-        # 用 OpenProcess 只做存在性检查。
-        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-        ERROR_INVALID_PARAMETER = 87
-
-        kernel32 = _get_win_kernel32()
-        handle = kernel32.OpenProcess(
-            PROCESS_QUERY_LIMITED_INFORMATION, False, pid
-        )
-        if handle:
-            kernel32.CloseHandle(handle)
-            return False
-
-        err = ctypes.get_last_error()
-        if err == ERROR_INVALID_PARAMETER:
-            # 进程确实不存在 → 陈旧锁
-            return True
-        # 权限不足等其他错误：保守视为进程存在，避免误删别人的锁
-        return False
-
-    # Unix: os.kill(pid, 0) 只检查存在性，不发信号
-    try:
-        os.kill(pid, 0)
-        return False
-    except ProcessLookupError:
-        return True
-    except PermissionError:
-        # 进程存在，只是属于别的用户，不算陈旧
-        return False
-    except OSError:
-        return True
-
-
-class InstanceLock:
-    def __init__(self, path: str):
-        self.path = path
-        self.fd = None
-
-    def acquire(self) -> bool:
-        try:
-            ensure_data_dir()
-            fd = os.open(
-                self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600
-            )
-        except FileExistsError:
-            if _is_stale_lock(self.path):
-                try:
-                    os.remove(self.path)
-                except OSError:
-                    return False
-                return self.acquire()
-            return False
-        except OSError:
-            # 目录不可写之类，不阻止运行
-            return True
-
-        try:
-            os.write(fd, str(os.getpid()).encode("ascii"))
-        except OSError:
-            os.close(fd)
-            try:
-                os.remove(self.path)
-            except OSError:
-                pass
-            return True
-
-        self.fd = fd
-        return True
-
-    def release(self) -> None:
-        try:
-            if self.fd is not None:
-                os.close(self.fd)
-                self.fd = None
-
-            if not os.path.exists(self.path):
-                return
-
-            # 只有锁文件里还是自己的 PID 时才删除，
-            # 避免竞态场景下误删别的实例的锁。
-            try:
-                with open(self.path, "r", encoding="ascii") as f:
-                    owner = f.read().strip()
-            except OSError:
-                return
-
-            if owner == str(os.getpid()):
-                try:
-                    os.remove(self.path)
-                except OSError:
-                    pass
+            os.remove(tmp)
         except OSError:
             pass
+        raise
+
+
+def load_records():
+    with _records_lock:
+        return _read_records_unlocked()
+
+
+def append_record(record) -> bool:
+    with _records_lock:
+        records = _read_records_unlocked()
+        records.append(record)
+        try:
+            _write_records_unlocked(records)
+            return True
+        except OSError:
+            return False
 
 
 # ============================================================
-# HTML 转义
+# 游戏逻辑
 # ============================================================
-def _esc(value) -> str:
-    return html.escape(str(value), quote=True)
+LEVELS = {
+    "1": {"name": "简单", "max_num": 1000, "max_attempts": 20},
+    "2": {"name": "中等", "max_num": 10000, "max_attempts": 30},
+    "3": {"name": "困难", "max_num": 100000, "max_attempts": 40},
+}
+
+_games: dict = {}
+_games_lock = threading.Lock()
+
+
+def _resolve_level(level: str, payload: dict):
+    if level in LEVELS:
+        c = LEVELS[level]
+        return c["name"], c["max_num"], c["max_attempts"]
+    if level == "4":
+        try:
+            max_num = int(payload.get("max_num"))
+            max_att = int(payload.get("max_attempts"))
+        except (TypeError, ValueError):
+            raise ValueError("自定义难度参数无效")
+        if max_num < 2:
+            raise ValueError("范围上限至少为 2")
+        if max_att < 1:
+            raise ValueError("猜测次数至少为 1")
+        return f"自定义(1-{max_num}, {max_att}次)", max_num, max_att
+    raise ValueError("难度无效")
+
+
+def _snapshot(g: dict) -> dict:
+    attempts = len(g["guesses"])
+    return {
+        "id": g["id"],
+        "name": g["name"],
+        "max_num": g["max_num"],
+        "max_attempts": g["max_attempts"],
+        "low": g["low"],
+        "high": g["high"],
+        "attempts": attempts,
+        "remaining": g["max_attempts"] - attempts,
+        "guesses": list(g["guesses"]),
+        "marks": list(g["marks"]),
+        "finished": g["finished"],
+        "answer": g["answer"] if g["finished"] else None,
+    }
+
+
+def new_game(level: str, payload: dict) -> dict:
+    name, max_num, max_att = _resolve_level(level, payload)
+    answer = random.randint(1, max_num)
+    gid = uuid.uuid4().hex
+    game = {
+        "id": gid,
+        "name": name,
+        "max_num": max_num,
+        "max_attempts": max_att,
+        "answer": answer,
+        "low": 1,
+        "high": max_num,
+        "guesses": [],
+        "marks": [],
+        "finished": False,
+        "win": False,
+    }
+    with _games_lock:
+        _games[gid] = game
+    return _snapshot(game)
+
+
+def submit_guess(gid: str, value: int) -> dict:
+    record = None
+    with _games_lock:
+        g = _games.get(gid)
+        if g is None:
+            raise KeyError("游戏不存在或已过期")
+        if g["finished"]:
+            raise ValueError("本局已结束")
+        if value < g["low"] or value > g["high"]:
+            raise ValueError(f"请猜 {g['low']} 到 {g['high']} 之间的数字")
+        if value in g["guesses"]:
+            raise ValueError("这个数字已经猜过了")
+
+        g["guesses"].append(value)
+        attempts = len(g["guesses"])
+        answer = g["answer"]
+
+        if value < answer:
+            g["low"] = max(g["low"], value + 1)
+            direction = "low"
+            g["marks"].append("low")
+        elif value > answer:
+            g["high"] = min(g["high"], value - 1)
+            direction = "high"
+            g["marks"].append("high")
+        else:
+            direction = "win"
+            g["marks"].append("win")
+            g["finished"] = True
+            g["win"] = True
+
+        if not g["finished"] and attempts >= g["max_attempts"]:
+            direction = "lose"
+            g["finished"] = True
+            g["win"] = False
+
+        result = _snapshot(g)
+        result["direction"] = direction
+        result["percent"] = (
+            attempts / g["max_attempts"] * 100 if g["win"] else None
+        )
+
+        if g["finished"]:
+            record = {
+                "win": g["win"],
+                "level_name": g["name"],
+                "answer": answer,
+                "attempts": attempts,
+                "max_attempts": g["max_attempts"],
+                "guesses": list(g["guesses"]),
+                "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            }
+            _games.pop(gid, None)
+
+    if record:
+        append_record(record)
+    return result
+
+
+def history_page(page: int, size: int) -> dict:
+    records = list(reversed(load_records()))  # 最新在前
+    total = len(records)
+    pages = max(1, (total + size - 1) // size)
+    page = max(1, min(page, pages))
+    start = (page - 1) * size
+    items = []
+    for i, r in enumerate(records[start:start + size]):
+        items.append({
+            "no": total - (start + i),
+            "win": r["win"],
+            "level_name": r["level_name"],
+            "answer": r["answer"],
+            "attempts": r["attempts"],
+            "max_attempts": r["max_attempts"],
+            "percent": (
+                f"{r['attempts'] / r['max_attempts'] * 100:.2f}%"
+                if r["win"] and r["max_attempts"] else ""
+            ),
+            "guesses": r["guesses"],
+            "time": r["time"],
+        })
+    return {"page": page, "pages": pages, "total": total, "items": items}
+
+
+def stats() -> dict:
+    records = load_records()
+    total = len(records)
+    wins = [r for r in records if r["win"]]
+    n_win = len(wins)
+    win_attempts = sum(r["attempts"] for r in wins)
+    win_max = sum(r["max_attempts"] for r in wins)
+    return {
+        "total": total,
+        "wins": n_win,
+        "win_rate": (n_win / total * 100) if total else 0.0,
+        "win_attempts": win_attempts,
+        "win_max_attempts": win_max,
+        "win_percent": (win_attempts / win_max * 100) if win_max else 0.0,
+        "avg_attempts": (win_attempts / n_win) if n_win else 0.0,
+    }
 
 
 # ============================================================
 # 导出
 # ============================================================
-def export_to_csv(records: list, filepath: str) -> None:
-    with open(filepath, "w", newline="", encoding="utf-8-sig") as f:
-        writer = csv.writer(f)
-        writer.writerow([
-            "序号", "时间", "难度", "结果", "正确答案",
-            "使用次数", "最大次数", "使用次数百分比", "猜测序列",
+def export_csv(records) -> str:
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["序号", "时间", "难度", "结果", "正确答案",
+                "使用次数", "最大次数", "使用次数百分比", "猜测序列"])
+    for i, r in enumerate(records, 1):
+        pct = (f"{r['attempts'] / r['max_attempts'] * 100:.2f}%"
+               if r["win"] and r["max_attempts"] else "")
+        guesses = " -> ".join(map(str, r["guesses"])) if r["guesses"] else ""
+        w.writerow([
+            i, r["time"], r["level_name"],
+            "猜对" if r["win"] else "失败",
+            r["answer"], r["attempts"], r["max_attempts"], pct, guesses,
         ])
-
-        for i, rec in enumerate(records, 1):
-            status = "猜对" if rec["win"] else "失败"
-            percent = ""
-            if rec["win"] and rec["max_attempts"] > 0:
-                percent = f"{rec['attempts'] / rec['max_attempts'] * 100:.2f}%"
-
-            guesses = " -> ".join(map(str, rec["guesses"])) if rec["guesses"] else ""
-
-            writer.writerow([
-                i,
-                rec["time"],
-                rec["level_name"],
-                status,
-                rec["answer"],
-                rec["attempts"],
-                rec["max_attempts"],
-                percent,
-                guesses,
-            ])
+    return buf.getvalue()
 
 
-def export_to_html(records: list, filepath: str) -> None:
-    lines = [
+def export_html(records) -> str:
+    parts = [
         "<!DOCTYPE html>",
-        "<html lang='zh-CN'>",
-        "<head>",
-        "<meta charset='utf-8'>",
+        "<html lang='zh-CN'><head><meta charset='utf-8'>",
         "<title>猜数字游戏历史记录</title>",
         "<style>",
-        "body { font-family: 'Microsoft YaHei', Arial, sans-serif; margin: 20px; }",
-        "h1 { color: #333; }",
-        "table { border-collapse: collapse; width: 100%; }",
-        "th, td { border: 1px solid #999; padding: 6px 10px; text-align: center; }",
-        "th { background-color: #f0f0f0; }",
-        "tr:nth-child(even) { background-color: #fafafa; }",
-        ".win { color: green; font-weight: bold; }",
-        ".lose { color: red; font-weight: bold; }",
-        "</style>",
-        "</head>",
-        "<body>",
+        "body{font-family:'Microsoft YaHei',Arial,sans-serif;margin:20px}",
+        "h1{color:#333}table{border-collapse:collapse;width:100%}",
+        "th,td{border:1px solid #999;padding:6px 10px;text-align:center}",
+        "th{background:#f0f0f0}tr:nth-child(even){background:#fafafa}",
+        ".win{color:green;font-weight:bold}.lose{color:red;font-weight:bold}",
+        "</style></head><body>",
         "<h1>猜数字游戏历史记录</h1>",
-        f"<p>导出时间：{_esc(datetime.now().strftime('%Y-%m-%d %H:%M:%S'))}，"
+        f"<p>导出时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}，"
         f"共 {len(records)} 条记录</p>",
-        "<table>",
-        "<tr>"
+        "<table><tr>"
         "<th>序号</th><th>时间</th><th>难度</th><th>结果</th>"
         "<th>正确答案</th><th>使用次数</th><th>最大次数</th>"
         "<th>使用次数百分比</th><th>猜测序列</th>"
         "</tr>",
     ]
-
-    for i, rec in enumerate(records, 1):
-        status_class = "win" if rec["win"] else "lose"
-        status_text = "猜对" if rec["win"] else "失败"
-
-        percent = ""
-        if rec["win"] and rec["max_attempts"] > 0:
-            percent = f"{rec['attempts'] / rec['max_attempts'] * 100:.2f}%"
-
-        guesses = " -> ".join(map(str, rec["guesses"])) if rec["guesses"] else ""
-
-        lines.append(
-            "<tr>"
-            f"<td>{i}</td>"
-            f"<td>{_esc(rec['time'])}</td>"
-            f"<td>{_esc(rec['level_name'])}</td>"
-            f"<td class='{status_class}'>{status_text}</td>"
-            f"<td>{_esc(rec['answer'])}</td>"
-            f"<td>{_esc(rec['attempts'])}</td>"
-            f"<td>{_esc(rec['max_attempts'])}</td>"
-            f"<td>{_esc(percent)}</td>"
-            f"<td>{_esc(guesses)}</td>"
-            "</tr>"
+    for i, r in enumerate(records, 1):
+        cls = "win" if r["win"] else "lose"
+        status = "猜对" if r["win"] else "失败"
+        pct = (f"{r['attempts'] / r['max_attempts'] * 100:.2f}%"
+               if r["win"] and r["max_attempts"] else "")
+        guesses = (" -> ".join(map(str, r["guesses"]))
+                   if r["guesses"] else "")
+        parts.append(
+            f"<tr><td>{i}</td><td>{html.escape(r['time'])}</td>"
+            f"<td>{html.escape(r['level_name'])}</td>"
+            f"<td class='{cls}'>{status}</td>"
+            f"<td>{r['answer']}</td><td>{r['attempts']}</td>"
+            f"<td>{r['max_attempts']}</td><td>{pct}</td>"
+            f"<td>{html.escape(guesses)}</td></tr>"
         )
-
-    lines.extend(["</table>", "</body>", "</html>"])
-
-    with open(filepath, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines))
-
-
-def _unique_export_path(scope_name: str, ext: str) -> str:
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    suffix = secrets.token_hex(2)
-    return os.path.join(
-        EXPORT_DIR, f"guess_records_{scope_name}_{timestamp}_{suffix}.{ext}"
-    )
-
-
-def export_records(records: list) -> None:
-    clear_screen()
-    print("=" * 60)
-    print("导出历史记录")
-    print("=" * 60)
-
-    if not records:
-        print("暂无记录，无法导出。")
-        input("\n按回车返回主菜单...")
-        return
-
-    print(f"当前共有 {len(records)} 条记录。")
-    print()
-    print("请选择导出格式：")
-    print("1 - CSV（推荐，WPS 表格可直接打开）")
-    print("2 - HTML（WPS 文字 / 浏览器可打开）")
-    print("3 - 同时导出 CSV 和 HTML")
-    print("0 - 取消")
-
-    choice = input("\n请输入：").strip()
-    if choice == "0":
-        return
-    if choice not in ("1", "2", "3"):
-        print("输入无效。")
-        input("按回车返回...")
-        return
-
-    print()
-    print("请选择导出范围：")
-    print("1 - 全部记录")
-    print("2 - 仅最近 10 条（最新在上）")
-    print("3 - 仅猜对的记录")
-    print("4 - 仅失败的记录")
-    scope = input("请输入：").strip()
-
-    if scope == "1":
-        data, scope_name = list(records), "全部"
-    elif scope == "2":
-        data, scope_name = list(reversed(records[-10:])), "最近10条"
-    elif scope == "3":
-        data, scope_name = [r for r in records if r["win"]], "猜对"
-    elif scope == "4":
-        data, scope_name = [r for r in records if not r["win"]], "失败"
-    else:
-        print("输入无效。")
-        input("按回车返回...")
-        return
-
-    if not data:
-        print("该范围内没有记录。")
-        input("按回车返回...")
-        return
-
-    ensure_data_dir()
-    exported_files = []
-
-    try:
-        if choice in ("1", "3"):
-            csv_path = _unique_export_path(scope_name, "csv")
-            export_to_csv(data, csv_path)
-            exported_files.append(csv_path)
-
-        if choice in ("2", "3"):
-            html_path = _unique_export_path(scope_name, "html")
-            export_to_html(data, html_path)
-            exported_files.append(html_path)
-    except OSError as e:
-        print(f"导出失败：{e}")
-        input("按回车返回...")
-        return
-
-    print("\n" + "=" * 60)
-    print("导出成功！")
-    print("=" * 60)
-    for p in exported_files:
-        print(f"  {p}")
-    print()
-    print("提示：")
-    print("- CSV 文件用 WPS 表格打开即可，中文已处理不会乱码。")
-    print("- HTML 文件可直接用浏览器打开，也可用 WPS 文字打开。")
-    print(f"- 导出文件位置：{EXPORT_DIR}")
-    input("\n按回车返回主菜单...")
+    parts.append("</table></body></html>")
+    return "\n".join(parts)
 
 
 # ============================================================
-# 界面工具
+# 前端页面（内嵌，无需外部文件）
 # ============================================================
-def clear_screen() -> None:
-    if not sys.stdout.isatty():
-        return
-    os.system("cls" if os.name == "nt" else "clear")
+HTML_PAGE = r"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#0b1220">
+<title>猜数字游戏</title>
+<style>
+*,*::before,*::after{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{margin:0;background:#0b1220;color:#e8eefc;min-height:100vh;
+  font:16px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+  touch-action:manipulation}
+.hidden{display:none!important}
+.topbar{position:fixed;top:0;left:0;right:0;z-index:10;display:flex;
+  align-items:center;justify-content:space-between;padding:14px 16px;
+  padding-top:calc(14px + env(safe-area-inset-top));
+  background:#0e1730;border-bottom:1px solid #1e2b47}
+.brand{font-size:17px;font-weight:700}
+.status{font-size:12px;color:#7f93b8;border:1px solid #24334f;
+  border-radius:999px;padding:3px 10px}
+.status.bad{color:#ff8b8b;border-color:#5a2a2a}
+main{padding:16px;padding-top:calc(74px + env(safe-area-inset-top));
+  padding-bottom:calc(90px + env(safe-area-inset-bottom));
+  max-width:640px;margin:0 auto}
+.title{font-size:16px;font-weight:600;color:#a9bce0;margin:0 0 12px}
+.levels{display:grid;gap:10px;grid-template-columns:1fr}
+@media(min-width:520px){.levels{grid-template-columns:1fr 1fr}}
+.level{display:flex;flex-direction:column;gap:2px;align-items:flex-start;
+  width:100%;padding:14px 16px;border-radius:14px;min-height:64px;
+  background:#16213a;border:1px solid #24334f;color:#e8eefc;
+  font-size:16px;text-align:left;cursor:pointer;
+  transition:transform .08s ease,background .15s ease}
+.level:active{transform:scale(.985);background:#1c2a46}
+.level b{font-size:16px}
+.level small{font-size:12px;color:#8fa3c8}
+.card{background:#16213a;border:1px solid #24334f;border-radius:14px;
+  padding:14px;margin-bottom:12px}
+input[type=number],select{width:100%;padding:12px 14px;border-radius:12px;
+  background:#0f1830;border:1px solid #2a3a5c;color:#e8eefc;
+  font-size:16px;outline:none}
+input[type=number]::-webkit-outer-spin-button,
+input[type=number]::-webkit-inner-spin-button{-webkit-appearance:none;margin:0}
+input:focus,select:focus{border-color:#4f8cff}
+label{display:block;font-size:13px;color:#8fa3c8;margin:10px 0 6px}
+label:first-child{margin-top:0}
+.btn{display:inline-flex;align-items:center;justify-content:center;
+  min-height:48px;padding:0 18px;border-radius:12px;font-size:16px;
+  font-weight:600;cursor:pointer;border:1px solid #2a3a5c;
+  background:#1c2a46;color:#e8eefc;transition:transform .08s ease}
+.btn:active{transform:scale(.97)}
+.btn.primary{background:linear-gradient(180deg,#4f8cff,#3b6fe0);
+  border-color:#3b6fe0;color:#fff}
+.btn.ghost{background:transparent}
+.btn.block{width:100%}
+.btn:disabled{opacity:.45;cursor:not-allowed}
+.row{display:flex;align-items:center;gap:10px}
+.row.between{justify-content:space-between}
+.muted{color:#8fa3c8}.small{font-size:13px}
+.range{display:flex;justify-content:center;align-items:baseline;gap:10px;
+  font-size:26px;font-weight:700;margin:10px 0}
+.bar{height:6px;border-radius:3px;background:#0f1830;overflow:hidden}
+.bar i{display:block;height:100%;width:0;
+  background:linear-gradient(90deg,#4f8cff,#38d39f);transition:width .25s}
+.feedback{min-height:44px;display:flex;align-items:center;
+  font-size:15px;color:#a9bce0;margin-bottom:10px}
+.feedback.low{color:#8fbcff}.feedback.high{color:#ffc861}
+.feedback.win{color:#5ee0b0;font-weight:700}
+.feedback.lose{color:#ff9b9b;font-weight:700}
+.feedback.warn{color:#ffc861}
+.input-row{display:flex;gap:8px}
+.input-row input{flex:1;min-width:0}
+.input-row .btn{flex:0 0 auto;padding:0 24px}
+.chips{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
+.chip{font-size:13px;padding:4px 10px;border-radius:999px;
+  background:#0f1830;border:1px solid #2a3a5c;color:#a9bce0}
+.chip.low{border-color:#3b6fe0;color:#8fbcff}
+.chip.high{border-color:#7a5a1a;color:#ffc861}
+.chip.win{border-color:#2a7a5c;color:#5ee0b0;font-weight:700}
+.list{display:flex;flex-direction:column;gap:10px}
+.list-item{background:#16213a;border:1px solid #24334f;
+  border-left:4px solid #2a3a5c;border-radius:12px;padding:12px 14px}
+.list-item.win{border-left-color:#38d39f}
+.list-item.lose{border-left-color:#ff6b6b}
+.li-head{display:flex;justify-content:space-between;align-items:center;
+  gap:8px;margin-bottom:6px}
+.li-row{display:flex;justify-content:space-between;gap:12px;
+  font-size:14px;color:#8fa3c8;padding:2px 0}
+.li-row b{color:#e8eefc;font-weight:600;text-align:right;word-break:break-all}
+.mono{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:13px}
+.tag{font-size:12px;padding:2px 8px;border-radius:999px;border:1px solid}
+.tag.ok{color:#5ee0b0;border-color:#2a7a5c}
+.tag.bad{color:#ff9b9b;border-color:#7a2a2a}
+.pager{display:flex;align-items:center;justify-content:space-between;
+  gap:10px;margin-top:14px}
+.pager .btn{min-height:42px;padding:0 14px;font-size:14px}
+.stats{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.stat{background:#16213a;border:1px solid #24334f;
+  border-radius:12px;padding:14px}
+.stat .k{font-size:12px;color:#8fa3c8}
+.stat .v{font-size:22px;font-weight:700;margin-top:4px}
+.stat.wide{grid-column:1/-1}
+.btn-row{display:flex;gap:10px;margin-top:12px}
+.btn-row .btn{flex:1}
+.hint{font-size:12px;color:#7f93b8;margin:10px 0 0}
+.tabbar{position:fixed;left:0;right:0;bottom:0;z-index:10;
+  display:grid;grid-template-columns:repeat(4,1fr);background:#0e1730;
+  border-top:1px solid #1e2b47;padding-bottom:env(safe-area-inset-bottom)}
+.tab{border:0;background:transparent;color:#7f93b8;padding:12px 4px;
+  font-size:13px;cursor:pointer;min-height:52px}
+.tab.active{color:#4f8cff;font-weight:700}
+</style>
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">🎯 猜数字</div>
+  <div class="status" id="status">就绪</div>
+</header>
+
+<main>
+  <section class="view" id="view-menu">
+    <h2 class="title">选择难度</h2>
+    <div class="levels">
+      <button class="level" data-level="1"><b>简单</b><small>1 ~ 1000 · 20 次机会</small></button>
+      <button class="level" data-level="2"><b>中等</b><small>1 ~ 10000 · 30 次机会</small></button>
+      <button class="level" data-level="3"><b>困难</b><small>1 ~ 100000 · 40 次机会</small></button>
+      <button class="level" data-level="4"><b>自定义</b><small>自己设定范围和次数</small></button>
+    </div>
+    <div class="card hidden" id="custom-card" style="margin-top:12px">
+      <label for="in-max">数字范围上限（≥ 2）</label>
+      <input id="in-max" type="number" inputmode="numeric" min="2" value="5000">
+      <label for="in-att">最大猜测次数（≥ 1）</label>
+      <input id="in-att" type="number" inputmode="numeric" min="1" value="15">
+      <p class="hint" id="custom-hint"></p>
+      <button class="btn primary block" id="btn-custom-start" style="margin-top:12px">开始游戏</button>
+    </div>
+  </section>
+
+  <section class="view hidden" id="view-game">
+    <div class="card">
+      <div class="row between">
+        <span class="muted" id="g-level">—</span>
+        <span class="muted">剩余 <b id="g-remain">0</b> 次</span>
+      </div>
+      <div class="range"><span id="g-low">1</span><span class="muted">~</span><span id="g-high">1000</span></div>
+      <div class="bar"><i id="g-bar"></i></div>
+    </div>
+    <div class="card">
+      <div class="feedback" id="g-feedback">输入一个数字开始猜吧</div>
+      <form id="guess-form" autocomplete="off">
+        <div class="input-row">
+          <input id="guess-input" type="number" inputmode="numeric" enterkeyhint="go"
+                 placeholder="输入数字" autocomplete="off">
+          <button type="submit" class="btn primary">猜</button>
+        </div>
+      </form>
+      <button class="btn primary block hidden" id="btn-again" style="margin-top:10px">再来一局</button>
+    </div>
+    <div class="card">
+      <div class="muted small">猜测记录</div>
+      <div class="chips" id="g-chips"><span class="muted small">暂无</span></div>
+    </div>
+    <button class="btn ghost block" id="btn-menu">返回菜单</button>
+  </section>
+
+  <section class="view hidden" id="view-history">
+    <h2 class="title">历史记录（最新在前）</h2>
+    <div id="history-list" class="list"></div>
+    <div class="pager">
+      <button class="btn ghost" id="h-prev">上一页</button>
+      <span class="muted small" id="h-info">—</span>
+      <button class="btn ghost" id="h-next">下一页</button>
+    </div>
+  </section>
+
+  <section class="view hidden" id="view-stats">
+    <h2 class="title">统计</h2>
+    <div class="stats" id="stats-box"></div>
+  </section>
+
+  <section class="view hidden" id="view-export">
+    <h2 class="title">导出记录</h2>
+    <div class="card">
+      <label for="ex-scope">导出范围</label>
+      <select id="ex-scope">
+        <option value="all">全部记录</option>
+        <option value="recent">最近 10 条</option>
+        <option value="win">仅猜对</option>
+        <option value="lose">仅失败</option>
+      </select>
+      <div class="btn-row">
+        <button class="btn primary" data-export="csv">导出 CSV</button>
+        <button class="btn primary" data-export="html">导出 HTML</button>
+      </div>
+      <p class="hint">CSV 用 WPS / Excel 打开；HTML 用浏览器打开。</p>
+    </div>
+  </section>
+</main>
+
+<nav class="tabbar">
+  <button class="tab active" data-view="menu">开始</button>
+  <button class="tab" data-view="history">历史</button>
+  <button class="tab" data-view="stats">统计</button>
+  <button class="tab" data-view="export">导出</button>
+</nav>
+
+<script>
+(function(){
+"use strict";
+var $=function(id){return document.getElementById(id)};
+var state={view:"menu",game:null,lastLevel:null,lastExtra:null,historyPage:1};
+
+function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,function(c){
+  return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]})}
+function setStatus(t,c){var e=$("status");e.textContent=t;e.className="status"+(c?" "+c:"")}
+function show(e,on){e.classList.toggle("hidden",!on)}
+
+async function api(m,u,b){
+  var o={method:m,headers:{Accept:"application/json"}};
+  if(b!==undefined){o.headers["Content-Type"]="application/json";o.body=JSON.stringify(b)}
+  var r=await fetch(u,o);var d={};
+  try{d=await r.json()}catch(e){d={}}
+  if(!r.ok)throw new Error(d.error||("请求失败 "+r.status));
+  return d;
+}
+function focusInput(){var e=$("guess-input");if(e.disabled)return;
+  setTimeout(function(){try{e.focus({preventScroll:true})}catch(x){try{e.focus()}catch(y){}}},60)}
+
+var VIEWS=["menu","game","history","stats","export"];
+function setView(n){
+  state.view=n;
+  VIEWS.forEach(function(v){show($("view-"+v),v===n)});
+  var tn=(n==="game")?"menu":n;
+  Array.prototype.forEach.call(document.querySelectorAll(".tab"),function(t){
+    t.classList.toggle("active",t.dataset.view===tn)});
+  if(n==="history")loadHistory(state.historyPage);
+  if(n==="stats")loadStats();
+  window.scrollTo(0,0);
+}
+
+async function startGame(level,extra){
+  setStatus("正在开始…");
+  try{
+    var p=Object.assign({level:String(level)},extra||{});
+    var d=await api("POST","/api/game",p);
+    state.lastLevel=String(level);state.lastExtra=extra||null;
+    state.game={id:d.id,name:d.name,max_num:d.max_num,max_attempts:d.max_attempts,
+      low:d.low,high:d.high,attempts:d.attempts,remaining:d.remaining,
+      guesses:d.guesses,marks:d.marks,finished:d.finished,answer:d.answer};
+    $("guess-input").value="";
+    setFeedback("输入一个数字开始猜吧","");
+    renderGame();setView("game");setStatus("游戏中");focusInput();
+  }catch(e){setStatus("出错","bad");alert("无法开始游戏："+e.message)}
+}
+
+function renderGame(){
+  var g=state.game;if(!g)return;
+  $("g-level").textContent=g.name;
+  $("g-remain").textContent=g.remaining;
+  $("g-low").textContent=g.low;$("g-high").textContent=g.high;
+  $("g-bar").style.width=Math.min(100,(g.attempts/g.max_attempts)*100)+"%";
+  var c=$("g-chips");
+  if(!g.guesses||!g.guesses.length){c.innerHTML='<span class="muted small">暂无</span>'}
+  else{c.innerHTML=g.guesses.map(function(n,i){
+    var m=(g.marks&&g.marks[i])||"";
+    return '<span class="chip'+(m?" "+m:"")+'">'+esc(n)+"</span>"}).join("")}
+  var inp=$("guess-input");
+  inp.disabled=!!g.finished;inp.min=g.low;inp.max=g.high;
+  show($("btn-again"),!!g.finished);
+}
+
+function setFeedback(t,c){var e=$("g-feedback");e.textContent=t;
+  e.className="feedback"+(c?" "+c:"")}
+
+async function submitGuess(raw){
+  var g=state.game;if(!g||g.finished)return;
+  var t=String(raw).trim();
+  if(!t){setFeedback("请输入一个数字","warn");return}
+  var v=Number(t);
+  if(!isFinite(v)||Math.floor(v)!==v){setFeedback("请输入整数","warn");return}
+  try{var d=await api("POST","/api/guess",{id:g.id,guess:v});applyGuess(d)}
+  catch(e){setFeedback(e.message,"warn")}
+}
+
+function applyGuess(d){
+  var g=state.game;
+  g.low=d.low;g.high=d.high;g.attempts=d.attempts;g.remaining=d.remaining;
+  g.guesses=d.guesses;g.marks=d.marks;g.finished=d.finished;
+  if(d.answer!==undefined&&d.answer!==null)g.answer=d.answer;
+  $("guess-input").value="";
+  if(d.direction==="low")setFeedback("太小了，往大猜 ⬆️","low");
+  else if(d.direction==="high")setFeedback("太大了，往小猜 ⬇️","high");
+  else if(d.direction==="win"){
+    setFeedback("🎉 猜对了！答案是 "+d.answer+"，用了 "+d.attempts+" 次（"+
+      (d.percent!=null?d.percent.toFixed(2)+"%":"")+"）","win");
+    setStatus("已结束");
+  }else if(d.direction==="lose"){
+    setFeedback("😵 次数用完了，正确答案是 "+d.answer,"lose");
+    setStatus("已结束");
+  }
+  renderGame();
+  if(!g.finished)focusInput();
+}
+
+async function loadHistory(page){
+  var box=$("history-list");
+  try{
+    var d=await api("GET","/api/history?page="+encodeURIComponent(page)+"&size=10");
+    state.historyPage=d.page;
+    $("h-info").textContent="第 "+d.page+" / "+d.pages+" 页 · 共 "+d.total+" 条";
+    $("h-prev").disabled=d.page<=1;$("h-next").disabled=d.page>=d.pages;
+    if(!d.items.length){box.innerHTML='<p class="muted">暂无记录</p>';return}
+    box.innerHTML=d.items.map(function(r){
+      var gs=(r.guesses&&r.guesses.length)?r.guesses.join(" → "):"无";
+      return '<div class="list-item '+(r.win?"win":"lose")+'">'+
+        '<div class="li-head"><span class="tag '+(r.win?"ok":"bad")+'">'+
+        (r.win?"猜对":"失败")+'</span><span class="muted small">#'+r.no+" · "+esc(r.time)+"</span></div>"+
+        '<div class="li-row"><span>难度</span><b>'+esc(r.level_name)+"</b></div>"+
+        '<div class="li-row"><span>答案</span><b>'+esc(r.answer)+"</b></div>"+
+        '<div class="li-row"><span>使用次数</span><b>'+esc(r.attempts)+" / "+esc(r.max_attempts)+"</b></div>"+
+        (r.percent?'<div class="li-row"><span>使用次数百分比</span><b>'+esc(r.percent)+"</b></div>":"")+
+        '<div class="li-row"><span>猜测序列</span><b class="mono">'+esc(gs)+"</b></div></div>"
+    }).join("");
+  }catch(e){box.innerHTML='<p class="feedback lose">加载失败：'+esc(e.message)+"</p>"}
+}
+
+async function loadStats(){
+  var box=$("stats-box");
+  try{
+    var d=await api("GET","/api/stats");
+    if(!d.total){box.innerHTML='<p class="muted">暂无数据</p>';return}
+    function cell(k,v,w){return '<div class="stat'+(w?" wide":"")+'"><div class="k">'+
+      esc(k)+'</div><div class="v">'+esc(v)+"</div></div>"}
+    var h=cell("总局数",d.total)+cell("猜对局数",d.wins)+
+          cell("猜对率",d.win_rate.toFixed(2)+"%",true);
+    if(d.wins){
+      h+=cell("猜对累计使用次数",d.win_attempts)+
+         cell("猜对累计可用次数",d.win_max_attempts)+
+         cell("猜对使用次数百分比",d.win_percent.toFixed(2)+"%",true)+
+         cell("平均每局猜对使用次数",d.avg_attempts.toFixed(2),true);
+    }else{h+=cell("猜对使用次数百分比","暂无数据",true)}
+    box.innerHTML=h;
+  }catch(e){box.innerHTML='<p class="feedback lose">加载失败：'+esc(e.message)+"</p>"}
+}
+
+function updateCustomHint(){
+  var maxN=parseInt($("in-max").value,10),att=parseInt($("in-att").value,10);
+  var h=$("custom-hint");
+  if(!isFinite(maxN)||maxN<2){h.textContent="范围上限至少为 2。";return}
+  var need=Math.ceil(Math.log(maxN+1)/Math.log(2));
+  var t="理论最少 "+need+" 次即可保证猜中。";
+  if(isFinite(att)&&att>0&&att<need)t+=" 你设置的次数偏少，可能会很难获胜。";
+  h.textContent=t;
+}
+
+function bind(){
+  Array.prototype.forEach.call(document.querySelectorAll(".level"),function(b){
+    b.addEventListener("click",function(){
+      var lv=b.dataset.level;
+      if(lv==="4"){show($("custom-card"),true);updateCustomHint();
+        try{$("in-max").focus()}catch(e){}}
+      else{show($("custom-card"),false);startGame(lv)}
+    })});
+  $("in-max").addEventListener("input",updateCustomHint);
+  $("in-att").addEventListener("input",updateCustomHint);
+  $("btn-custom-start").addEventListener("click",function(){
+    var maxN=parseInt($("in-max").value,10),att=parseInt($("in-att").value,10);
+    if(!isFinite(maxN)||maxN<2){alert("范围上限至少为 2");return}
+    if(!isFinite(att)||att<1){alert("猜测次数至少为 1");return}
+    startGame("4",{max_num:maxN,max_attempts:att});
+  });
+  $("guess-form").addEventListener("submit",function(e){
+    e.preventDefault();submitGuess($("guess-input").value)});
+  $("btn-again").addEventListener("click",function(){
+    if(state.lastLevel)startGame(state.lastLevel,state.lastExtra)});
+  $("btn-menu").addEventListener("click",function(){
+    state.game=null;setView("menu");setStatus("就绪")});
+  Array.prototype.forEach.call(document.querySelectorAll(".tab"),function(t){
+    t.addEventListener("click",function(){
+      var v=t.dataset.view;
+      setView(v==="menu"?(state.game?"game":"menu"):v)})});
+  $("h-prev").addEventListener("click",function(){
+    if(state.historyPage>1)loadHistory(state.historyPage-1)});
+  $("h-next").addEventListener("click",function(){loadHistory(state.historyPage+1)});
+  Array.prototype.forEach.call(document.querySelectorAll("[data-export]"),function(b){
+    b.addEventListener("click",function(){
+      var fmt=b.dataset.export,scope=$("ex-scope").value;
+      setStatus("正在导出…");
+      window.location.href="/api/export?fmt="+encodeURIComponent(fmt)+
+                           "&scope="+encodeURIComponent(scope);
+      setTimeout(function(){setStatus("就绪")},1500);
+    })});
+}
+
+function init(){bind();updateCustomHint();setView("menu");setStatus("就绪")}
+if(document.readyState==="loading")document.addEventListener("DOMContentLoaded",init);
+else init();
+})();
+</script>
+</body>
+</html>
+"""
 
 
 # ============================================================
-# 游戏主体
+# HTTP 服务
 # ============================================================
-def get_custom_level() -> dict:
-    clear_screen()
-    print("=" * 40)
-    print("自定义难度设置")
-    print("=" * 40)
+class Handler(BaseHTTPRequestHandler):
+    server_version = "GuessGame/1.0"
 
-    while True:
+    def log_message(self, fmt, *args):
+        pass  # 关闭访问日志，避免控制台刷屏
+
+    # ---------- 输出工具 ----------
+    def _send(self, code, body, ctype="application/json; charset=utf-8"):
+        if isinstance(body, str):
+            body = body.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
         try:
-            max_num = int(input("请输入数字范围上限（至少为 2，例如 5000）：").strip())
-            if max_num < 2:
-                print("范围上限必须至少为 2！请重新输入。")
-                continue
-            break
-        except ValueError:
-            print("只能输入正整数！请重新输入。")
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
-    while True:
+    def _json(self, code, obj):
+        self._send(code, json.dumps(obj, ensure_ascii=False))
+
+    def _read_json(self) -> dict:
         try:
-            max_attempts = int(
-                input("请输入最大猜测次数（至少为 1，例如 15）：").strip()
-            )
-            if max_attempts < 1:
-                print("猜测次数必须至少为 1！请重新输入。")
-                continue
-            break
+            length = int(self.headers.get("Content-Length") or 0)
         except ValueError:
-            print("只能输入正整数！请重新输入。")
-
-    min_needed = math.ceil(math.log2(max_num + 1))
-    print(f"\n提示：对于 1-{max_num} 的范围，理论上最少 {min_needed} 次即可猜中。")
-    if max_attempts < min_needed:
-        print(
-            f"注意：你设置的次数（{max_attempts}）低于理论最少次数"
-            f"（{min_needed}），可能会很难获胜！"
-        )
-    input("按回车确认...")
-
-    return {
-        "name": f"自定义(1-{max_num}, {max_attempts}次)",
-        "max_num": max_num,
-        "max_attempts": max_attempts,
-    }
-
-
-def play_one_round() -> GameRecord:
-    config = None
-
-    while config is None:
-        clear_screen()
-        print("请选择难度等级：")
-        print("1 - 简单 (1-1000，最多猜 20 次)")
-        print("2 - 中等 (1-10000，最多猜 30 次)")
-        print("3 - 困难 (1-100000，最多猜 40 次)")
-        print("4 - 自定义 (自己设置范围和次数)")
-        diff = input("\n请输入数字 1、2、3 或 4：").strip()
-
-        if diff in LEVELS:
-            config = LEVELS[diff]
-        elif diff == "4":
-            config = get_custom_level()
-        else:
-            print("输入无效，按回车重新选择...")
-            input()
-
-    max_num = config["max_num"]
-    max_attempts = config["max_attempts"]
-    answer = random.randint(1, max_num)
-
-    attempts = 0
-    history = []
-    min_range, max_range = 1, max_num
-
-    clear_screen()
-    print(f"难度已选择：【{config['name']}】")
-    print(f"我已经想好了一个 1 到 {max_num} 之间的数字。")
-    print(f"你有 {max_attempts} 次机会。")
-
-    while attempts < max_attempts:
-        remain = max_attempts - attempts
-        hist_str = " -> ".join(map(str, history)) if history else "无"
-
-        print("=" * 40)
-        print(f"当前范围：{min_range} ~ {max_range} | 剩余次数：{remain}")
-        print(f"历史猜测：{hist_str}")
-
+            length = 0
+        if length <= 0:
+            return {}
+        raw = self.rfile.read(length)
         try:
-            guess_str = input(
-                f"请输入你猜测的数字（{min_range}-{max_range}）："
-            ).strip()
-            if guess_str == "":
-                print("不能为空，请重新输入！")
-                continue
-            guess = int(guess_str)
-        except ValueError:
-            print("只能输入正整数！")
-            continue
+            return json.loads(raw.decode("utf-8"))
+        except Exception:
+            raise ValueError("请求格式错误")
 
-        if guess < min_range or guess > max_range:
-            print("这个数不在当前可能范围内！")
-            continue
-
-        if guess in history:
-            print("你已经猜过这个数字了！")
-            continue
-
-        attempts += 1
-        history.append(guess)
-
-        if guess < answer:
-            min_range = max(min_range, guess + 1)
-            print("太小了！")
-        elif guess > answer:
-            max_range = min(max_range, guess - 1)
-            print("太大了！")
-        else:
-            used_percent = attempts / max_attempts * 100
-            print("=" * 40)
-            print(
-                f"恭喜你，猜对了！正确答案就是 {answer}，"
-                f"你一共猜了 {attempts} 次。"
-            )
-            print(
-                f"本局猜对使用次数百分比："
-                f"{attempts}/{max_attempts} = {used_percent:.2f}%"
-            )
-            return {
-                "win": True,
-                "level_name": config["name"],
-                "answer": answer,
-                "attempts": attempts,
-                "max_attempts": max_attempts,
-                "guesses": history.copy(),
-                "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            }
-
-    print("=" * 40)
-    print(f"很遗憾，次数用完了。正确答案是：{answer}")
-    return {
-        "win": False,
-        "level_name": config["name"],
-        "answer": answer,
-        "attempts": attempts,
-        "max_attempts": max_attempts,
-        "guesses": history.copy(),
-        "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-    }
-
-
-def view_history(records: list) -> None:
-    clear_screen()
-    print("=" * 60)
-    print(f"历史记录（共 {len(records)} 条）")
-    print("=" * 60)
-
-    if not records:
-        print("暂无历史记录。")
-        input("\n按回车返回主菜单...")
-        return
-
-    PAGE_SIZE = 10
-    total_pages = (len(records) + PAGE_SIZE - 1) // PAGE_SIZE
-    page = 1
-
-    while True:
-        clear_screen()
-        print("=" * 60)
-        print(f"历史记录（第 {page}/{total_pages} 页，共 {len(records)} 条）")
-        print("=" * 60)
-
-        start = (page - 1) * PAGE_SIZE
-        end = min(start + PAGE_SIZE, len(records))
-
-        for i in range(start, end):
-            rec = records[i]
-            status = "猜对" if rec["win"] else "失败"
-            print(f"{i + 1}. [{rec['level_name']}] {status}")
-            print(
-                f"   答案：{rec['answer']}  "
-                f"使用次数：{rec['attempts']}/{rec['max_attempts']}"
-            )
-
-            if rec["win"] and rec["max_attempts"] > 0:
-                percent = rec["attempts"] / rec["max_attempts"] * 100
-                print(f"   使用次数百分比：{percent:.2f}%")
-
-            guesses = (
-                " -> ".join(map(str, rec["guesses"])) if rec["guesses"] else "无"
-            )
-            print(f"   猜测序列：{guesses}")
-            print(f"   时间：{rec['time']}")
-            print("-" * 60)
-
-        print("\n操作：n - 下一页  p - 上一页  f - 跳转页码  0 - 返回主菜单")
-        cmd = input("请输入操作：").strip().lower()
-
-        if cmd == "n":
-            if page < total_pages:
-                page += 1
+    # ---------- GET ----------
+    def do_GET(self):
+        u = urlparse(self.path)
+        q = parse_qs(u.query)
+        try:
+            if u.path in ("/", "/index.html"):
+                self._send(200, HTML_PAGE, "text/html; charset=utf-8")
+            elif u.path == "/api/history":
+                page = int(q.get("page", ["1"])[0])
+                size = max(1, min(50, int(q.get("size", ["10"])[0])))
+                self._json(200, history_page(page, size))
+            elif u.path == "/api/stats":
+                self._json(200, stats())
+            elif u.path == "/api/export":
+                self._handle_export(q)
             else:
-                print("已经是最后一页了。")
-                input("按回车继续...")
-        elif cmd == "p":
-            if page > 1:
-                page -= 1
+                self._json(404, {"error": "未找到"})
+        except ValueError as e:
+            self._json(400, {"error": str(e)})
+        except Exception as e:
+            self._json(500, {"error": "服务器错误：" + str(e)})
+
+    # ---------- POST ----------
+    def do_POST(self):
+        u = urlparse(self.path)
+        try:
+            if u.path == "/api/game":
+                payload = self._read_json()
+                level = str(payload.get("level", ""))
+                self._json(200, new_game(level, payload))
+            elif u.path == "/api/guess":
+                payload = self._read_json()
+                gid = str(payload.get("id", ""))
+                try:
+                    guess = int(payload.get("guess"))
+                except (TypeError, ValueError):
+                    raise ValueError("请输入整数")
+                self._json(200, submit_guess(gid, guess))
             else:
-                print("已经是第一页了。")
-                input("按回车继续...")
-        elif cmd == "f":
-            try:
-                target = int(input(f"请输入页码（1-{total_pages}）：").strip())
-                if 1 <= target <= total_pages:
-                    page = target
-                else:
-                    print("页码超出范围。")
-                    input("按回车继续...")
-            except ValueError:
-                print("输入无效。")
-                input("按回车继续...")
-        elif cmd == "0":
+                self._json(404, {"error": "未找到"})
+        except KeyError as e:
+            self._json(404, {"error": str(e).strip("'\"")})
+        except ValueError as e:
+            self._json(400, {"error": str(e)})
+        except Exception as e:
+            self._json(500, {"error": "服务器错误：" + str(e)})
+
+    # ---------- 导出 ----------
+    def _handle_export(self, q):
+        fmt = q.get("fmt", ["csv"])[0].lower()
+        scope = q.get("scope", ["all"])[0]
+        records = load_records()
+
+        if scope == "recent":
+            data = list(reversed(records[-10:]))
+        elif scope == "win":
+            data = [r for r in records if r["win"]]
+        elif scope == "lose":
+            data = [r for r in records if not r["win"]]
+        else:
+            data = list(records)
+
+        if not data:
+            self._json(400, {"error": "该范围内没有记录"})
             return
+
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        if fmt == "html":
+            body = export_html(data).encode("utf-8")
+            fname = f"guess_records_{scope}_{stamp}.html"
+            ctype = "text/html; charset=utf-8"
         else:
-            print("输入无效。")
-            input("按回车继续...")
+            body = export_csv(data).encode("utf-8-sig")  # 带 BOM，WPS/Excel 不乱码
+            fname = f"guess_records_{scope}_{stamp}.csv"
+            ctype = "text/csv; charset=utf-8"
 
-
-def show_stats(records: list) -> None:
-    clear_screen()
-    print("=" * 60)
-    print("游戏统计")
-    print("=" * 60)
-
-    total_rounds = len(records)
-    win_records = [r for r in records if r["win"]]
-    win_rounds = len(win_records)
-
-    print(f"总局数：{total_rounds}")
-    print(f"猜对局数：{win_rounds}")
-
-    if total_rounds == 0:
-        print("暂无数据。")
-        input("\n按回车返回主菜单...")
-        return
-
-    print(f"猜对率：{win_rounds / total_rounds * 100:.2f}%")
-
-    if win_rounds == 0:
-        print("没有猜对过，无法计算猜对使用次数百分比。")
-        input("\n按回车返回主菜单...")
-        return
-
-    total_win_attempts = sum(r["attempts"] for r in win_records)
-    total_win_max_attempts = sum(r["max_attempts"] for r in win_records)
-    percent = (
-        total_win_attempts / total_win_max_attempts * 100
-        if total_win_max_attempts
-        else 0
-    )
-
-    print(f"猜对时累计使用次数：{total_win_attempts}")
-    print(f"猜对时累计可用次数：{total_win_max_attempts}")
-    print(f"猜对使用次数百分比：{percent:.2f}%")
-    print(f"平均每局猜对使用次数：{total_win_attempts / win_rounds:.2f}")
-
-    input("\n按回车返回主菜单...")
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header(
+            "Content-Disposition",
+            f'attachment; filename="{fname}"',
+        )
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
 
 # ============================================================
-# 主流程
+# 启动
 # ============================================================
+def get_lan_ip() -> str:
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+    except OSError:
+        return "127.0.0.1"
+    finally:
+        s.close()
+
+
+def find_port(start: int = 8000, tries: int = 30) -> int:
+    for port in range(start, start + tries):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                s.bind(("0.0.0.0", port))
+                return port
+            except OSError:
+                continue
+    raise RuntimeError("找不到可用端口")
+
+
 def main() -> None:
     try:
-        ensure_data_dir()
+        ensure_dirs()
     except OSError as e:
-        print(f"[错误] 无法创建数据目录：{DATA_DIR}")
-        print(f"原因：{e}")
-        print("请检查磁盘空间和目录权限。")
+        print(f"[错误] 无法创建数据目录：{DATA_DIR}\n原因：{e}")
         input("按回车退出...")
         sys.exit(1)
 
-    lock = None
-    if USE_SINGLE_INSTANCE:
-        lock = InstanceLock(LOCK_FILE)
-        if not lock.acquire():
-            print("检测到猜数字游戏已在运行。")
-            print("如果确认没有其他窗口在运行，可删除锁文件后重试：")
-            print(f"  {LOCK_FILE}")
-            input("按回车退出...")
-            sys.exit(0)
+    port = find_port(8000)
+    httpd = ThreadingHTTPServer(("0.0.0.0", port), Handler)
+    lan_ip = get_lan_ip()
+
+    print("=" * 60)
+    print("  猜数字游戏 · Web 版")
+    print("=" * 60)
+    print(f"  电脑访问：  http://127.0.0.1:{port}")
+    print(f"  手机访问：  http://{lan_ip}:{port}")
+    print(f"  数据目录：  {DATA_DIR}")
+    print()
+    print("  ⚠ 手机需和电脑连在同一个 Wi-Fi 下")
+    print("  ⚠ 首次运行如弹防火墙提示，请点【允许访问】")
+    print("  按 Ctrl+C 退出")
+    print("=" * 60)
 
     try:
-        records = load_records(interactive=True)
+        webbrowser.open(f"http://127.0.0.1:{port}")
+    except Exception:
+        pass
 
-        clear_screen()
-        print("=" * 60)
-        print("欢迎来到猜数字游戏！")
-        print("=" * 60)
-        print(f"数据目录：{DATA_DIR}")
-        print(f"记录文件：{os.path.basename(RECORDS_FILE)}")
-        print(f"导出目录：{EXPORT_DIR}")
-        print(f"已加载历史记录 {len(records)} 条。")
-        input("按回车开始游戏...")
-
-        while True:
-            record = play_one_round()
-
-            if not append_record(records, record):
-                print("\n注意：本局记录未能保存到磁盘，已从内存中回滚。")
-                input("按回车继续...")
-
-            while True:
-                print("\n" + "=" * 40)
-                print("请选择操作：")
-                print("1 - 再来一局")
-                print("2 - 查看历史记录")
-                print("3 - 查看统计")
-                print("4 - 导出记录（CSV / HTML，WPS 可打开）")
-                print("5 - 退出游戏")
-                choice = input("请输入数字 1、2、3、4 或 5：").strip()
-
-                if choice == "1":
-                    break
-                elif choice == "2":
-                    view_history(records)
-                elif choice == "3":
-                    show_stats(records)
-                elif choice == "4":
-                    export_records(records)
-                elif choice == "5":
-                    print("游戏已退出，感谢游玩！")
-                    return
-                else:
-                    print("输入无效，请重新选择。")
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        print("\n正在退出…")
     finally:
-        if lock is not None:
-            lock.release()
-
-
-# ============================================================
-# 单元测试
-# ============================================================
-class _Tests(unittest.TestCase):
-    def test_theoretical_min(self):
-        self.assertEqual(math.ceil(math.log2(2 + 1)), 2)
-        self.assertEqual(math.ceil(math.log2(3 + 1)), 2)
-        self.assertEqual(math.ceil(math.log2(4 + 1)), 3)
-        self.assertEqual(math.ceil(math.log2(1000 + 1)), 10)
-
-    def test_xor_roundtrip(self):
-        key = _key_bytes()
-        data = "你好，guess_game! 12345"
-        cipher = _xor_bytes(data.encode("utf-8"), key)
-        plain = _xor_bytes(cipher, key).decode("utf-8")
-        self.assertEqual(plain, data)
-
-    def test_encrypt_decrypt_roundtrip(self):
-        text = "hello 猜数字"
-        self.assertEqual(decrypt_text(encrypt_text(text)), text)
-
-    def test_mac_tamper_detected(self):
-        token = encrypt_text("hello")
-        raw = json.loads(base64.b64decode(token.encode("ascii")).decode("utf-8"))
-        raw["m"] = "0" * 64
-        bad = base64.b64encode(
-            json.dumps(raw, ensure_ascii=False).encode("utf-8")
-        ).decode("ascii")
-        with self.assertRaises(ValueError):
-            decrypt_text(bad)
-
-    def test_csv_empty(self):
-        with tempfile.TemporaryDirectory() as d:
-            p = os.path.join(d, "x.csv")
-            export_to_csv([], p)
-            with open(p, "r", encoding="utf-8-sig") as f:
-                content = f.read()
-            self.assertIn("序号", content)
-
-    def test_csv_with_records(self):
-        rec = {
-            "win": True,
-            "level_name": "简单",
-            "answer": 42,
-            "attempts": 3,
-            "max_attempts": 20,
-            "guesses": [50, 25, 42],
-            "time": "2024-01-01 00:00:00",
-        }
-        rec2 = {
-            "win": False,
-            "level_name": "中等",
-            "answer": 777,
-            "attempts": 30,
-            "max_attempts": 30,
-            "guesses": [1, 2, 3],
-            "time": "2024-01-02 00:00:00",
-        }
-        with tempfile.TemporaryDirectory() as d:
-            p = os.path.join(d, "x.csv")
-            export_to_csv([rec, rec2], p)
-            with open(p, "r", encoding="utf-8-sig") as f:
-                rows = list(csv.reader(f))
-            self.assertEqual(len(rows), 3)
-            self.assertEqual(rows[1][3], "猜对")
-            self.assertEqual(rows[1][7], "15.00%")
-            self.assertEqual(rows[2][3], "失败")
-            self.assertEqual(rows[2][7], "")
-
-    def test_html_escape(self):
-        rec = {
-            "win": True,
-            "level_name": "<script>bad</script>",
-            "answer": 1,
-            "attempts": 1,
-            "max_attempts": 1,
-            "guesses": [1],
-            "time": "2024-01-01 00:00:00",
-        }
-        with tempfile.TemporaryDirectory() as d:
-            p = os.path.join(d, "x.html")
-            export_to_html([rec], p)
-            with open(p, "r", encoding="utf-8") as f:
-                content = f.read()
-            self.assertNotIn("<script>", content)
-            self.assertIn("&lt;script&gt;", content)
-
-    def test_backup_cleanup(self):
-        """两类备份文件各自保留 MAX_BACKUPS 个。"""
-        with tempfile.TemporaryDirectory() as d:
-            with mock.patch.object(sys.modules[__name__], "BACKUP_DIR", d), \
-                 mock.patch.object(sys.modules[__name__], "MAX_BACKUPS", 2):
-                for i in range(5):
-                    open(os.path.join(d, f"records.bak_2024010{i}_000000"), "w").close()
-                    open(os.path.join(d, f"records.corrupt_2024010{i}_000000"), "w").close()
-
-                _cleanup_backups()
-
-                remaining = os.listdir(d)
-                bak = [f for f in remaining if f.startswith("records.bak_")]
-                corrupt = [f for f in remaining if f.startswith("records.corrupt_")]
-                self.assertEqual(len(bak), 2)
-                self.assertEqual(len(corrupt), 2)
-                # 保留文件名最大的两个（时间戳最新）
-                self.assertIn("records.bak_20240104_000000", bak)
-
-    def test_instance_lock_acquire_release(self):
-        with tempfile.TemporaryDirectory() as d:
-            p = os.path.join(d, "instance.lock")
-            lock = InstanceLock(p)
-            self.assertTrue(lock.acquire())
-            self.assertTrue(os.path.exists(p))
-
-            lock2 = InstanceLock(p)
-            self.assertFalse(lock2.acquire())
-
-            lock.release()
-            self.assertFalse(os.path.exists(p))
-
-    def test_instance_lock_release_does_not_remove_others(self):
-        """release 时若锁文件里的 PID 不是自己的，不应删除。"""
-        with tempfile.TemporaryDirectory() as d:
-            p = os.path.join(d, "instance.lock")
-            with open(p, "w", encoding="ascii") as f:
-                f.write("12345")  # 假装是别的进程
-
-            lock = InstanceLock(p)
-            lock.release()  # self.fd 为 None，但应尝试读取并跳过删除
-            self.assertTrue(os.path.exists(p))
-
-    def test_stale_lock_detected(self):
-        with tempfile.TemporaryDirectory() as d:
-            p = os.path.join(d, "instance.lock")
-            with open(p, "w", encoding="ascii") as f:
-                f.write("99999999")
-            self.assertTrue(_is_stale_lock(p))
-
-    def test_append_record_rollback_on_failure(self):
-        """save_records 返回 False 时 append_record 应回滚。"""
-        records = []
-        with mock.patch.object(
-            sys.modules[__name__], "save_records", return_value=False
-        ):
-            ok = append_record(records, {
-                "win": True, "level_name": "x", "answer": 1,
-                "attempts": 1, "max_attempts": 1,
-                "guesses": [1], "time": "t",
-            })
-        self.assertFalse(ok)
-        self.assertEqual(records, [])
-
-    def test_load_records_non_interactive(self):
-        """损坏文件在 interactive=False 时不阻塞，返回空列表，且不打印。"""
-        with tempfile.TemporaryDirectory() as d:
-            with mock.patch.object(sys.modules[__name__], "DATA_DIR", d), \
-                 mock.patch.object(sys.modules[__name__], "BACKUP_DIR", os.path.join(d, "b")), \
-                 mock.patch.object(sys.modules[__name__], "RECORDS_FILE", os.path.join(d, "records.dat")):
-                os.makedirs(os.path.join(d, "b"), exist_ok=True)
-                with open(os.path.join(d, "records.dat"), "w", encoding="utf-8") as f:
-                    f.write("this is not a valid token")
-                result = load_records(interactive=False)
-                self.assertEqual(result, [])
-
-
-def _run_tests() -> int:
-    """运行单元测试，返回退出码（不直接 sys.exit）。"""
-    suite = unittest.TestLoader().loadTestsFromTestCase(_Tests)
-    runner = unittest.TextTestRunner(verbosity=2)
-    result = runner.run(suite)
-    return 0 if result.wasSuccessful() else 1
-
-
-# ============================================================
-# 入口
-# ============================================================
-if __name__ == "__main__":
-    if "--test" in sys.argv:
-        sys.exit(_run_tests())
-    else:
         try:
-            main()
-        except KeyboardInterrupt:
-            print("\n\n游戏被中断，已退出。")
-            sys.exit(0)
+            httpd.shutdown()
+            httpd.server_close()
+        except Exception:
+            pass
+
+
+if __name__ == "__main__":
+    main()
