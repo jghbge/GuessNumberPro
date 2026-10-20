@@ -2,10 +2,16 @@
 # -*- coding: utf-8 -*-
 """
 猜数字游戏 · Web 版（PC / 手机通用）
-打包：
+✅支持Windows、Mac(苹果)、华为安卓手机
+✅支持【同一局域网】+【跨不同网络外网访问】(pyngrok内网穿透)
+
+打包命令：
+    pip install pyngrok
     pyinstaller --onefile --name GuessGame --console guess_game_web.py
-运行后浏览器访问 http://127.0.0.1:端口
-同一 Wi-Fi 下手机访问 http://<电脑局域网IP>:端口
+
+运行：
+    python guess_game_web.py
+    启动后会打印：本地地址、局域网地址、公网外网地址（pyngrok隧道）
 """
 
 import base64
@@ -27,6 +33,13 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
+# ============ 新增：pyngrok内网穿透 实现跨不同网络访问 ============
+NGROK_AVAILABLE = False
+try:
+    from pyngrok import ngrok
+    NGROK_AVAILABLE = True
+except ImportError:
+    pass
 
 # ============================================================
 # 加密存储（与原版一致：XOR + HMAC）
@@ -497,6 +510,7 @@ label:first-child{margin-top:0}
 .tab.active{color:#4f8cff;font-weight:700}
 </style>
 </head>
+
 <body>
 
 <header class="topbar">
@@ -582,6 +596,7 @@ label:first-child{margin-top:0}
       <p class="hint">CSV 用 WPS / Excel 打开；HTML 用浏览器打开。</p>
     </div>
   </section>
+
 </main>
 
 <nav class="tabbar">
@@ -783,8 +798,10 @@ function init(){bind();updateCustomHint();setView("menu");setStatus("就绪")}
 if(document.readyState==="loading")document.addEventListener("DOMContentLoaded",init);
 else init();
 })();
+
 </script>
 </body>
+
 </html>
 """
 
@@ -900,7 +917,7 @@ class Handler(BaseHTTPRequestHandler):
             fname = f"guess_records_{scope}_{stamp}.html"
             ctype = "text/html; charset=utf-8"
         else:
-            body = export_csv(data).encode("utf-8-sig")  # 带 BOM，WPS/Excel 不乱码
+            body = export_csv(data).encode("utf-8-sig")
             fname = f"guess_records_{scope}_{stamp}.csv"
             ctype = "text/csv; charset=utf-8"
 
@@ -956,17 +973,32 @@ def main() -> None:
     httpd = ThreadingHTTPServer(("0.0.0.0", port), Handler)
     lan_ip = get_lan_ip()
 
-    print("=" * 60)
-    print("  猜数字游戏 · Web 版")
-    print("=" * 60)
-    print(f"  电脑访问：  http://127.0.0.1:{port}")
-    print(f"  手机访问：  http://{lan_ip}:{port}")
-    print(f"  数据目录：  {DATA_DIR}")
+    # ============启动pyngrok隧道，实现不同网络访问 ============
+    public_url = None
+    if NGROK_AVAILABLE:
+        try:
+            print("\n正在启动外网隧道（pyngrok），请稍候...")
+            tunnel = ngrok.connect(port, "http")
+            public_url = tunnel.public_url
+        except Exception as ex:
+            print(f"⚠️ 外网隧道启动失败：{ex}，仅局域网可用")
+    else:
+        print("💡未安装pyngrok，只能同一wifi局域网访问；执行 pip install pyngrok 开启跨网访问")
+
+    print("=" * 70)
+    print("  🎯猜数字游戏 · Web多端版")
+    print("=" * 70)
+    print(f"  ✅本机访问：    http://127.0.0.1:{port}")
+    print(f"  ✅同WiFi手机：  http://{lan_ip}:{port}")
+    if public_url:
+        print(f"  ✅外网跨网络：  {public_url}")
+    print(f"  📂数据目录：    {DATA_DIR}")
     print()
-    print("  ⚠ 手机需和电脑连在同一个 Wi-Fi 下")
-    print("  ⚠ 首次运行如弹防火墙提示，请点【允许访问】")
-    print("  按 Ctrl+C 退出")
-    print("=" * 60)
+    print("  ⚠️ 同WiFi：手机连同一个wifi，输入局域网地址")
+    print("  ⚠️ 跨不同网络：复制【外网跨网络】链接发给手机（苹果/华为都可以浏览器打开）")
+    print("  ⚠️ Windows防火墙弹出，请允许访问网络")
+    print("  Ctrl+C 停止服务")
+    print("=" * 70)
 
     try:
         webbrowser.open(f"http://127.0.0.1:{port}")
@@ -978,6 +1010,9 @@ def main() -> None:
     except KeyboardInterrupt:
         print("\n正在退出…")
     finally:
+        if NGROK_AVAILABLE:
+            ngrok.disconnect(public_url)
+            ngrok.kill()
         try:
             httpd.shutdown()
             httpd.server_close()
