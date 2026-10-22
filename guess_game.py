@@ -4,16 +4,14 @@
 猜数字游戏 · Web 版（PC / 手机通用）
 ✅支持Windows、Mac(苹果)、华为安卓手机
 ✅支持【同一局域网】+【跨不同网络外网访问】(pyngrok内网穿透)
-
+✅新增：网页左下角设置弹窗：切换主题颜色、修改记录保存位置
 打包命令：
     pip install pyngrok
     pyinstaller --onefile --name GuessGame --console guess_game_web.py
-
 运行：
     python guess_game_web.py
     启动后会打印：本地地址、局域网地址、公网外网地址（pyngrok隧道）
 """
-
 import base64
 import csv
 import hashlib
@@ -32,7 +30,6 @@ import webbrowser
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
-
 # ============ 新增：pyngrok内网穿透 实现跨不同网络访问 ============
 NGROK_AVAILABLE = False
 try:
@@ -40,33 +37,22 @@ try:
     NGROK_AVAILABLE = True
 except ImportError:
     pass
-
 # ============================================================
 # 加密存储（与原版一致：XOR + HMAC）
 # ============================================================
 SECRET_KEY = "guess_game_secret_key_#2024@secure!"
-
-
 def _key_bytes() -> bytes:
     return hashlib.sha256(SECRET_KEY.encode("utf-8")).digest()
-
-
 def _xor(data: bytes, key: bytes) -> bytes:
     return bytes(b ^ key[i % len(key)] for i, b in enumerate(data))
-
-
 def _mac(cipher: bytes) -> str:
     return hmac.new(_key_bytes(), cipher, hashlib.sha256).hexdigest()
-
-
 def encrypt_text(text: str) -> str:
     cipher = _xor(text.encode("utf-8"), _key_bytes())
     payload = {"c": base64.b64encode(cipher).decode("ascii"), "m": _mac(cipher)}
     return base64.b64encode(
         json.dumps(payload, ensure_ascii=False).encode("utf-8")
     ).decode("ascii")
-
-
 def decrypt_text(token: str) -> str:
     raw = base64.b64decode(token.encode("ascii"))
     payload = json.loads(raw.decode("utf-8"))
@@ -75,11 +61,13 @@ def decrypt_text(token: str) -> str:
         raise ValueError("数据校验失败")
     return _xor(cipher, _key_bytes()).decode("utf-8")
 
-
 # ============================================================
-# 数据目录
+# 数据目录（支持环境变量GUESS_GAME_DATA_DIR自定义路径）
 # ============================================================
 def get_data_dir() -> str:
+    env_path = os.environ.get("GUESS_GAME_DATA_DIR","")
+    if env_path.strip() and os.path.isdir(env_path.strip()):
+        return env_path.strip()
     if os.name == "nt":
         base = os.environ.get("APPDATA") or os.path.expanduser("~")
     elif sys.platform == "darwin":
@@ -92,23 +80,18 @@ def get_data_dir() -> str:
         base = tempfile.gettempdir()
     return os.path.join(base, "GuessGame")
 
-
 DATA_DIR = get_data_dir()
 RECORDS_FILE = os.path.join(DATA_DIR, "records.dat")
 EXPORT_DIR = os.path.join(DATA_DIR, "exports")
-
 
 def ensure_dirs() -> None:
     os.makedirs(DATA_DIR, exist_ok=True)
     os.makedirs(EXPORT_DIR, exist_ok=True)
 
-
 # ============================================================
 # 记录读写
 # ============================================================
 _records_lock = threading.Lock()
-
-
 def _read_records_unlocked():
     if not os.path.exists(RECORDS_FILE):
         return []
@@ -127,8 +110,6 @@ def _read_records_unlocked():
         except OSError:
             pass
         return []
-
-
 def _write_records_unlocked(records) -> None:
     ensure_dirs()
     token = encrypt_text(json.dumps(records, ensure_ascii=False))
@@ -143,13 +124,9 @@ def _write_records_unlocked(records) -> None:
         except OSError:
             pass
         raise
-
-
 def load_records():
     with _records_lock:
         return _read_records_unlocked()
-
-
 def append_record(record) -> bool:
     with _records_lock:
         records = _read_records_unlocked()
@@ -160,7 +137,6 @@ def append_record(record) -> bool:
         except OSError:
             return False
 
-
 # ============================================================
 # 游戏逻辑
 # ============================================================
@@ -169,11 +145,8 @@ LEVELS = {
     "2": {"name": "中等", "max_num": 10000, "max_attempts": 30},
     "3": {"name": "困难", "max_num": 100000, "max_attempts": 40},
 }
-
 _games: dict = {}
 _games_lock = threading.Lock()
-
-
 def _resolve_level(level: str, payload: dict):
     if level in LEVELS:
         c = LEVELS[level]
@@ -190,8 +163,6 @@ def _resolve_level(level: str, payload: dict):
             raise ValueError("猜测次数至少为 1")
         return f"自定义(1-{max_num}, {max_att}次)", max_num, max_att
     raise ValueError("难度无效")
-
-
 def _snapshot(g: dict) -> dict:
     attempts = len(g["guesses"])
     return {
@@ -208,8 +179,6 @@ def _snapshot(g: dict) -> dict:
         "finished": g["finished"],
         "answer": g["answer"] if g["finished"] else None,
     }
-
-
 def new_game(level: str, payload: dict) -> dict:
     name, max_num, max_att = _resolve_level(level, payload)
     answer = random.randint(1, max_num)
@@ -230,8 +199,6 @@ def new_game(level: str, payload: dict) -> dict:
     with _games_lock:
         _games[gid] = game
     return _snapshot(game)
-
-
 def submit_guess(gid: str, value: int) -> dict:
     record = None
     with _games_lock:
@@ -244,11 +211,9 @@ def submit_guess(gid: str, value: int) -> dict:
             raise ValueError(f"请猜 {g['low']} 到 {g['high']} 之间的数字")
         if value in g["guesses"]:
             raise ValueError("这个数字已经猜过了")
-
         g["guesses"].append(value)
         attempts = len(g["guesses"])
         answer = g["answer"]
-
         if value < answer:
             g["low"] = max(g["low"], value + 1)
             direction = "low"
@@ -262,18 +227,15 @@ def submit_guess(gid: str, value: int) -> dict:
             g["marks"].append("win")
             g["finished"] = True
             g["win"] = True
-
         if not g["finished"] and attempts >= g["max_attempts"]:
             direction = "lose"
             g["finished"] = True
             g["win"] = False
-
         result = _snapshot(g)
         result["direction"] = direction
         result["percent"] = (
             attempts / g["max_attempts"] * 100 if g["win"] else None
         )
-
         if g["finished"]:
             record = {
                 "win": g["win"],
@@ -285,12 +247,9 @@ def submit_guess(gid: str, value: int) -> dict:
                 "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             }
             _games.pop(gid, None)
-
     if record:
         append_record(record)
     return result
-
-
 def history_page(page: int, size: int) -> dict:
     records = list(reversed(load_records()))  # 最新在前
     total = len(records)
@@ -314,8 +273,6 @@ def history_page(page: int, size: int) -> dict:
             "time": r["time"],
         })
     return {"page": page, "pages": pages, "total": total, "items": items}
-
-
 def stats() -> dict:
     records = load_records()
     total = len(records)
@@ -332,7 +289,6 @@ def stats() -> dict:
         "win_percent": (win_attempts / win_max * 100) if win_max else 0.0,
         "avg_attempts": (win_attempts / n_win) if n_win else 0.0,
     }
-
 
 # ============================================================
 # 导出
@@ -352,8 +308,6 @@ def export_csv(records) -> str:
             r["answer"], r["attempts"], r["max_attempts"], pct, guesses,
         ])
     return buf.getvalue()
-
-
 def export_html(records) -> str:
     parts = [
         "<!DOCTYPE html>",
@@ -393,9 +347,8 @@ def export_html(records) -> str:
     parts.append("</table></body></html>")
     return "\n".join(parts)
 
-
 # ============================================================
-# 前端页面（内嵌，无需外部文件）
+# 前端页面（新增设置弹窗、主题颜色）
 # ============================================================
 HTML_PAGE = r"""<!DOCTYPE html>
 <html lang="zh-CN">
@@ -407,62 +360,82 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <style>
 *,*::before,*::after{box-sizing:border-box}
 html{-webkit-text-size-adjust:100%}
-body{margin:0;background:#0b1220;color:#e8eefc;min-height:100vh;
+:root{
+  --bg-main:#0b1220;
+  --bg-card:#16213a;
+  --bg-topbar:#0e1730;
+  --text-normal:#e8eefc;
+  --text-muted:#8fa3c8;
+  --border-color:#24334f;
+  --primary:#4f8cff;
+  --primary-dark:#3b6fe0;
+}
+html.light-theme{
+  --bg-main:#f7f8fa;
+  --bg-card:#ffffff;
+  --bg-topbar:#ffffff;
+  --text-normal:#222428;
+  --text-muted:#666872;
+  --border-color:#d4d6dd;
+  --primary:#2b78e4;
+  --primary-dark:#1f62c2;
+}
+body{margin:0;background:var(--bg-main);color:var(--text-normal);min-height:100vh;
   font:16px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
   touch-action:manipulation}
 .hidden{display:none!important}
 .topbar{position:fixed;top:0;left:0;right:0;z-index:10;display:flex;
   align-items:center;justify-content:space-between;padding:14px 16px;
   padding-top:calc(14px + env(safe-area-inset-top));
-  background:#0e1730;border-bottom:1px solid #1e2b47}
+  background:var(--bg-topbar);border-bottom:1px solid var(--border-color)}
 .brand{font-size:17px;font-weight:700}
-.status{font-size:12px;color:#7f93b8;border:1px solid #24334f;
+.status{font-size:12px;color:var(--text-muted);border:1px solid var(--border-color);
   border-radius:999px;padding:3px 10px}
 .status.bad{color:#ff8b8b;border-color:#5a2a2a}
 main{padding:16px;padding-top:calc(74px + env(safe-area-inset-top));
   padding-bottom:calc(90px + env(safe-area-inset-bottom));
   max-width:640px;margin:0 auto}
-.title{font-size:16px;font-weight:600;color:#a9bce0;margin:0 0 12px}
+.title{font-size:16px;font-weight:600;color:var(--text-muted);margin:0 0 12px}
 .levels{display:grid;gap:10px;grid-template-columns:1fr}
 @media(min-width:520px){.levels{grid-template-columns:1fr 1fr}}
 .level{display:flex;flex-direction:column;gap:2px;align-items:flex-start;
   width:100%;padding:14px 16px;border-radius:14px;min-height:64px;
-  background:#16213a;border:1px solid #24334f;color:#e8eefc;
+  background:var(--bg-card);border:1px solid var(--border-color);color:var(--text-normal);
   font-size:16px;text-align:left;cursor:pointer;
   transition:transform .08s ease,background .15s ease}
-.level:active{transform:scale(.985);background:#1c2a46}
+.level:active{transform:scale(.985);background:rgba(120,140,180,0.12)}
 .level b{font-size:16px}
-.level small{font-size:12px;color:#8fa3c8}
-.card{background:#16213a;border:1px solid #24334f;border-radius:14px;
+.level small{font-size:12px;color:var(--text-muted)}
+.card{background:var(--bg-card);border:1px solid var(--border-color);border-radius:14px;
   padding:14px;margin-bottom:12px}
 input[type=number],select{width:100%;padding:12px 14px;border-radius:12px;
-  background:#0f1830;border:1px solid #2a3a5c;color:#e8eefc;
+  background:var(--bg-main);border:1px solid var(--border-color);color:var(--text-normal);
   font-size:16px;outline:none}
 input[type=number]::-webkit-outer-spin-button,
 input[type=number]::-webkit-inner-spin-button{-webkit-appearance:none;margin:0}
-input:focus,select:focus{border-color:#4f8cff}
-label{display:block;font-size:13px;color:#8fa3c8;margin:10px 0 6px}
+input:focus,select:focus{border-color:var(--primary)}
+label{display:block;font-size:13px;color:var(--text-muted);margin:10px 0 6px}
 label:first-child{margin-top:0}
 .btn{display:inline-flex;align-items:center;justify-content:center;
   min-height:48px;padding:0 18px;border-radius:12px;font-size:16px;
-  font-weight:600;cursor:pointer;border:1px solid #2a3a5c;
-  background:#1c2a46;color:#e8eefc;transition:transform .08s ease}
+  font-weight:600;cursor:pointer;border:1px solid var(--border-color);
+  background:var(--bg-card);color:var(--text-normal);transition:transform .08s ease}
 .btn:active{transform:scale(.97)}
-.btn.primary{background:linear-gradient(180deg,#4f8cff,#3b6fe0);
-  border-color:#3b6fe0;color:#fff}
+.btn.primary{background:linear-gradient(180deg,var(--primary),var(--primary-dark));
+  border-color:var(--primary-dark);color:#fff}
 .btn.ghost{background:transparent}
 .btn.block{width:100%}
 .btn:disabled{opacity:.45;cursor:not-allowed}
 .row{display:flex;align-items:center;gap:10px}
 .row.between{justify-content:space-between}
-.muted{color:#8fa3c8}.small{font-size:13px}
+.muted{color:var(--text-muted)}.small{font-size:13px}
 .range{display:flex;justify-content:center;align-items:baseline;gap:10px;
   font-size:26px;font-weight:700;margin:10px 0}
-.bar{height:6px;border-radius:3px;background:#0f1830;overflow:hidden}
+.bar{height:6px;border-radius:3px;background:var(--bg-main);overflow:hidden}
 .bar i{display:block;height:100%;width:0;
   background:linear-gradient(90deg,#4f8cff,#38d39f);transition:width .25s}
 .feedback{min-height:44px;display:flex;align-items:center;
-  font-size:15px;color:#a9bce0;margin-bottom:10px}
+  font-size:15px;color:var(--text-muted);margin-bottom:10px}
 .feedback.low{color:#8fbcff}.feedback.high{color:#ffc861}
 .feedback.win{color:#5ee0b0;font-weight:700}
 .feedback.lose{color:#ff9b9b;font-weight:700}
@@ -472,20 +445,20 @@ label:first-child{margin-top:0}
 .input-row .btn{flex:0 0 auto;padding:0 24px}
 .chips{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
 .chip{font-size:13px;padding:4px 10px;border-radius:999px;
-  background:#0f1830;border:1px solid #2a3a5c;color:#a9bce0}
+  background:var(--bg-main);border:1px solid var(--border-color);color:var(--text-muted)}
 .chip.low{border-color:#3b6fe0;color:#8fbcff}
 .chip.high{border-color:#7a5a1a;color:#ffc861}
 .chip.win{border-color:#2a7a5c;color:#5ee0b0;font-weight:700}
 .list{display:flex;flex-direction:column;gap:10px}
-.list-item{background:#16213a;border:1px solid #24334f;
-  border-left:4px solid #2a3a5c;border-radius:12px;padding:12px 14px}
+.list-item{background:var(--bg-card);border:1px solid var(--border-color);
+  border-left:4px solid var(--border-color);border-radius:12px;padding:12px 14px}
 .list-item.win{border-left-color:#38d39f}
 .list-item.lose{border-left-color:#ff6b6b}
 .li-head{display:flex;justify-content:space-between;align-items:center;
   gap:8px;margin-bottom:6px}
 .li-row{display:flex;justify-content:space-between;gap:12px;
-  font-size:14px;color:#8fa3c8;padding:2px 0}
-.li-row b{color:#e8eefc;font-weight:600;text-align:right;word-break:break-all}
+  font-size:14px;color:var(--text-muted);padding:2px 0}
+.li-row b{color:var(--text-normal);font-weight:600;text-align:right;word-break:break-all}
 .mono{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:13px}
 .tag{font-size:12px;padding:2px 8px;border-radius:999px;border:1px solid}
 .tag.ok{color:#5ee0b0;border-color:#2a7a5c}
@@ -494,30 +467,73 @@ label:first-child{margin-top:0}
   gap:10px;margin-top:14px}
 .pager .btn{min-height:42px;padding:0 14px;font-size:14px}
 .stats{display:grid;grid-template-columns:1fr 1fr;gap:10px}
-.stat{background:#16213a;border:1px solid #24334f;
+.stat{background:var(--bg-card);border:1px solid var(--border-color);
   border-radius:12px;padding:14px}
-.stat .k{font-size:12px;color:#8fa3c8}
+.stat .k{font-size:12px;color:var(--text-muted)}
 .stat .v{font-size:22px;font-weight:700;margin-top:4px}
 .stat.wide{grid-column:1/-1}
 .btn-row{display:flex;gap:10px;margin-top:12px}
 .btn-row .btn{flex:1}
-.hint{font-size:12px;color:#7f93b8;margin:10px 0 0}
+.hint{font-size:12px;color:var(--text-muted);margin:10px 0 0}
 .tabbar{position:fixed;left:0;right:0;bottom:0;z-index:10;
-  display:grid;grid-template-columns:repeat(4,1fr);background:#0e1730;
-  border-top:1px solid #1e2b47;padding-bottom:env(safe-area-inset-bottom)}
-.tab{border:0;background:transparent;color:#7f93b8;padding:12px 4px;
+  display:grid;grid-template-columns:repeat(4,1fr);background:var(--bg-topbar);
+  border-top:1px solid var(--border-color);padding-bottom:env(safe-area-inset-bottom)}
+.tab{border:0;background:transparent;color:var(--text-muted);padding:12px 4px;
   font-size:13px;cursor:pointer;min-height:52px}
-.tab.active{color:#4f8cff;font-weight:700}
+.tab.active{color:var(--primary);font-weight:700}
+
+/* ========== 设置按钮与弹窗 ========== */
+#setting-btn{
+  position:fixed;
+  left:14px;
+  bottom:calc(64px + env(safe-area-inset-bottom));
+  z-index:20;
+  width:44px;height:44px;
+  border-radius:50%;
+  border:1px solid var(--border-color);
+  background:var(--bg-card);
+  color:var(--text-normal);
+  font-size:20px;
+  cursor:pointer;
+  display:flex;align-items:center;justify-content:center;
+  box-shadow:0 2px 8px rgba(0,0,0,0.25);
+}
+#setting-modal{
+  position:fixed;inset:0;z-index:30;
+  background:rgba(0,0,0,0.55);
+  display:flex;align-items:center;justify-content:center;
+  padding:16px;
+}
+.modal-inner{
+  width:100%;max-width:440px;
+  background:var(--bg-card);
+  border-radius:16px;
+  border:1px solid var(--border-color);
+  padding:18px;
+  max-height:85vh;
+  overflow:auto;
+}
+.modal-head{
+  display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;
+}
+.modal-head h3{margin:0}
+#setting-close{
+  background:transparent;border:none;color:var(--text-normal);font-size:22px;cursor:pointer;
+}
+.color-pick-row{
+  display:flex;gap:8px;flex-wrap:wrap;margin:8px 0 14px;
+}
+.color-item{
+  width:36px;height:36px;border-radius:8px;cursor:pointer;border:2px solid transparent;
+}
+.color-item.active{border-color:#fff;box-shadow:0 0 0 2px var(--primary)}
 </style>
 </head>
-
 <body>
-
 <header class="topbar">
   <div class="brand">🎯 猜数字</div>
   <div class="status" id="status">就绪</div>
 </header>
-
 <main>
   <section class="view" id="view-menu">
     <h2 class="title">选择难度</h2>
@@ -536,7 +552,6 @@ label:first-child{margin-top:0}
       <button class="btn primary block" id="btn-custom-start" style="margin-top:12px">开始游戏</button>
     </div>
   </section>
-
   <section class="view hidden" id="view-game">
     <div class="card">
       <div class="row between">
@@ -563,7 +578,6 @@ label:first-child{margin-top:0}
     </div>
     <button class="btn ghost block" id="btn-menu">返回菜单</button>
   </section>
-
   <section class="view hidden" id="view-history">
     <h2 class="title">历史记录（最新在前）</h2>
     <div id="history-list" class="list"></div>
@@ -573,12 +587,10 @@ label:first-child{margin-top:0}
       <button class="btn ghost" id="h-next">下一页</button>
     </div>
   </section>
-
   <section class="view hidden" id="view-stats">
     <h2 class="title">统计</h2>
     <div class="stats" id="stats-box"></div>
   </section>
-
   <section class="view hidden" id="view-export">
     <h2 class="title">导出记录</h2>
     <div class="card">
@@ -596,8 +608,40 @@ label:first-child{margin-top:0}
       <p class="hint">CSV 用 WPS / Excel 打开；HTML 用浏览器打开。</p>
     </div>
   </section>
-
 </main>
+
+<!-- 设置按钮 -->
+<button id="setting-btn">⚙️</button>
+
+<!-- 设置弹窗 -->
+<div id="setting-modal" class="hidden">
+  <div class="modal-inner">
+    <div class="modal-head">
+      <h3>设置</h3>
+      <button id="setting-close">×</button>
+    </div>
+    <div class="card">
+      <label>主题模式</label>
+      <div class="btn-row">
+        <button class="btn" id="theme-dark">暗色主题</button>
+        <button class="btn" id="theme-light">亮色主题</button>
+      </div>
+      <label style="margin-top:14px">主色调选择</label>
+      <div class="color-pick-row" id="color-list">
+        <div class="color-item" data-color="#4f8cff" style="background:#4f8cff"></div>
+        <div class="color-item" data-color="#22bb88" style="background:#22bb88"></div>
+        <div class="color-item" data-color="#dd5555" style="background:#dd5555"></div>
+        <div class="color-item" data-color="#aa55dd" style="background:#aa55dd"></div>
+        <div class="color-item" data-color="#dd9922" style="background:#dd9922"></div>
+      </div>
+    </div>
+    <div class="card">
+      <label>记录保存目录（服务端生效）</label>
+      <p class="hint">修改需要重启程序：启动前设置环境变量 <code>GUESS_GAME_DATA_DIR</code> 为你的文件夹路径</p>
+      <p class="small muted" id="data-dir-show"></p>
+    </div>
+  </div>
+</div>
 
 <nav class="tabbar">
   <button class="tab active" data-view="menu">开始</button>
@@ -605,18 +649,56 @@ label:first-child{margin-top:0}
   <button class="tab" data-view="stats">统计</button>
   <button class="tab" data-view="export">导出</button>
 </nav>
-
 <script>
 (function(){
 "use strict";
 var $=function(id){return document.getElementById(id)};
 var state={view:"menu",game:null,lastLevel:null,lastExtra:null,historyPage:1};
 
+// ========== 主题本地存储 ==========
+const THEME_KEY = "guessgame_theme";
+const COLOR_KEY = "guessgame_primary";
+function loadTheme(){
+  const savedTheme = localStorage.getItem(THEME_KEY)||"dark";
+  const savedColor = localStorage.getItem(COLOR_KEY)||"#4f8cff";
+  applyTheme(savedTheme, savedColor);
+}
+function applyTheme(mode, color){
+  if(mode==="light"){
+    document.documentElement.classList.add("light-theme");
+  }else{
+    document.documentElement.classList.remove("light-theme");
+  }
+  document.documentElement.style.setProperty("--primary",color);
+  // 简单自动生成深色变体
+  let r=parseInt(color.slice(1,3),16);
+  let g=parseInt(color.slice(3,5),16);
+  let b=parseInt(color.slice(5,7),16);
+  r=Math.max(0,Math.round(r*0.75));
+  g=Math.max(0,Math.round(g*0.75));
+  b=Math.max(0,Math.round(b*0.75));
+  const darkColor=`rgb(${r},${g},${b})`;
+  document.documentElement.style.setProperty("--primary-dark",darkColor);
+  localStorage.setItem(THEME_KEY,mode);
+  localStorage.setItem(COLOR_KEY,color);
+  // 更新选中标记
+  Array.from(document.querySelectorAll(".color-item")).forEach(el=>{
+    el.classList.toggle("active",el.dataset.color===color);
+  })
+}
+
+var settingModal = $("setting-modal");
+function openSetting(){
+  settingModal.classList.remove("hidden");
+}
+function closeSetting(){
+  settingModal.classList.add("hidden");
+}
+
 function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,function(c){
   return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]})}
 function setStatus(t,c){var e=$("status");e.textContent=t;e.className="status"+(c?" "+c:"")}
 function show(e,on){e.classList.toggle("hidden",!on)}
-
 async function api(m,u,b){
   var o={method:m,headers:{Accept:"application/json"}};
   if(b!==undefined){o.headers["Content-Type"]="application/json";o.body=JSON.stringify(b)}
@@ -627,7 +709,6 @@ async function api(m,u,b){
 }
 function focusInput(){var e=$("guess-input");if(e.disabled)return;
   setTimeout(function(){try{e.focus({preventScroll:true})}catch(x){try{e.focus()}catch(y){}}},60)}
-
 var VIEWS=["menu","game","history","stats","export"];
 function setView(n){
   state.view=n;
@@ -639,7 +720,6 @@ function setView(n){
   if(n==="stats")loadStats();
   window.scrollTo(0,0);
 }
-
 async function startGame(level,extra){
   setStatus("正在开始…");
   try{
@@ -654,7 +734,6 @@ async function startGame(level,extra){
     renderGame();setView("game");setStatus("游戏中");focusInput();
   }catch(e){setStatus("出错","bad");alert("无法开始游戏："+e.message)}
 }
-
 function renderGame(){
   var g=state.game;if(!g)return;
   $("g-level").textContent=g.name;
@@ -670,10 +749,8 @@ function renderGame(){
   inp.disabled=!!g.finished;inp.min=g.low;inp.max=g.high;
   show($("btn-again"),!!g.finished);
 }
-
 function setFeedback(t,c){var e=$("g-feedback");e.textContent=t;
   e.className="feedback"+(c?" "+c:"")}
-
 async function submitGuess(raw){
   var g=state.game;if(!g||g.finished)return;
   var t=String(raw).trim();
@@ -683,7 +760,6 @@ async function submitGuess(raw){
   try{var d=await api("POST","/api/guess",{id:g.id,guess:v});applyGuess(d)}
   catch(e){setFeedback(e.message,"warn")}
 }
-
 function applyGuess(d){
   var g=state.game;
   g.low=d.low;g.high=d.high;g.attempts=d.attempts;g.remaining=d.remaining;
@@ -703,7 +779,6 @@ function applyGuess(d){
   renderGame();
   if(!g.finished)focusInput();
 }
-
 async function loadHistory(page){
   var box=$("history-list");
   try{
@@ -725,7 +800,6 @@ async function loadHistory(page){
     }).join("");
   }catch(e){box.innerHTML='<p class="feedback lose">加载失败：'+esc(e.message)+"</p>"}
 }
-
 async function loadStats(){
   var box=$("stats-box");
   try{
@@ -744,7 +818,6 @@ async function loadStats(){
     box.innerHTML=h;
   }catch(e){box.innerHTML='<p class="feedback lose">加载失败：'+esc(e.message)+"</p>"}
 }
-
 function updateCustomHint(){
   var maxN=parseInt($("in-max").value,10),att=parseInt($("in-att").value,10);
   var h=$("custom-hint");
@@ -754,7 +827,6 @@ function updateCustomHint(){
   if(isFinite(att)&&att>0&&att<need)t+=" 你设置的次数偏少，可能会很难获胜。";
   h.textContent=t;
 }
-
 function bind(){
   Array.prototype.forEach.call(document.querySelectorAll(".level"),function(b){
     b.addEventListener("click",function(){
@@ -792,29 +864,43 @@ function bind(){
                            "&scope="+encodeURIComponent(scope);
       setTimeout(function(){setStatus("就绪")},1500);
     })});
-}
 
-function init(){bind();updateCustomHint();setView("menu");setStatus("就绪")}
+  // 设置弹窗绑定
+  $("setting-btn").addEventListener("click",openSetting);
+  $("setting-close").addEventListener("click",closeSetting);
+  settingModal.addEventListener("click",function(e){
+    if(e.target===settingModal) closeSetting();
+  })
+  $("theme-dark").onclick=()=>applyTheme("dark",localStorage.getItem(COLOR_KEY)||"#4f8cff");
+  $("theme-light").onclick=()=>applyTheme("light",localStorage.getItem(COLOR_KEY)||"#4f8cff");
+  Array.from(document.querySelectorAll(".color-item")).forEach(el=>{
+    el.onclick=()=>{
+      applyTheme(localStorage.getItem(THEME_KEY)||"dark",el.dataset.color);
+    }
+  })
+}
+function init(){
+  bind();
+  loadTheme();
+  updateCustomHint();
+  setView("menu");
+  setStatus("就绪")
+}
 if(document.readyState==="loading")document.addEventListener("DOMContentLoaded",init);
 else init();
 })();
-
 </script>
 </body>
-
 </html>
 """
-
 
 # ============================================================
 # HTTP 服务
 # ============================================================
 class Handler(BaseHTTPRequestHandler):
     server_version = "GuessGame/1.0"
-
     def log_message(self, fmt, *args):
         pass  # 关闭访问日志，避免控制台刷屏
-
     # ---------- 输出工具 ----------
     def _send(self, code, body, ctype="application/json; charset=utf-8"):
         if isinstance(body, str):
@@ -828,10 +914,8 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(body)
         except (BrokenPipeError, ConnectionResetError):
             pass
-
     def _json(self, code, obj):
         self._send(code, json.dumps(obj, ensure_ascii=False))
-
     def _read_json(self) -> dict:
         try:
             length = int(self.headers.get("Content-Length") or 0)
@@ -844,7 +928,6 @@ class Handler(BaseHTTPRequestHandler):
             return json.loads(raw.decode("utf-8"))
         except Exception:
             raise ValueError("请求格式错误")
-
     # ---------- GET ----------
     def do_GET(self):
         u = urlparse(self.path)
@@ -866,7 +949,6 @@ class Handler(BaseHTTPRequestHandler):
             self._json(400, {"error": str(e)})
         except Exception as e:
             self._json(500, {"error": "服务器错误：" + str(e)})
-
     # ---------- POST ----------
     def do_POST(self):
         u = urlparse(self.path)
@@ -891,13 +973,11 @@ class Handler(BaseHTTPRequestHandler):
             self._json(400, {"error": str(e)})
         except Exception as e:
             self._json(500, {"error": "服务器错误：" + str(e)})
-
     # ---------- 导出 ----------
     def _handle_export(self, q):
         fmt = q.get("fmt", ["csv"])[0].lower()
         scope = q.get("scope", ["all"])[0]
         records = load_records()
-
         if scope == "recent":
             data = list(reversed(records[-10:]))
         elif scope == "win":
@@ -906,11 +986,9 @@ class Handler(BaseHTTPRequestHandler):
             data = [r for r in records if not r["win"]]
         else:
             data = list(records)
-
         if not data:
             self._json(400, {"error": "该范围内没有记录"})
             return
-
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         if fmt == "html":
             body = export_html(data).encode("utf-8")
@@ -920,7 +998,6 @@ class Handler(BaseHTTPRequestHandler):
             body = export_csv(data).encode("utf-8-sig")
             fname = f"guess_records_{scope}_{stamp}.csv"
             ctype = "text/csv; charset=utf-8"
-
         self.send_response(200)
         self.send_header("Content-Type", ctype)
         self.send_header(
@@ -934,7 +1011,6 @@ class Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass
 
-
 # ============================================================
 # 启动
 # ============================================================
@@ -947,8 +1023,6 @@ def get_lan_ip() -> str:
         return "127.0.0.1"
     finally:
         s.close()
-
-
 def find_port(start: int = 8000, tries: int = 30) -> int:
     for port in range(start, start + tries):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -959,8 +1033,6 @@ def find_port(start: int = 8000, tries: int = 30) -> int:
             except OSError:
                 continue
     raise RuntimeError("找不到可用端口")
-
-
 def main() -> None:
     try:
         ensure_dirs()
@@ -968,11 +1040,9 @@ def main() -> None:
         print(f"[错误] 无法创建数据目录：{DATA_DIR}\n原因：{e}")
         input("按回车退出...")
         sys.exit(1)
-
     port = find_port(8000)
     httpd = ThreadingHTTPServer(("0.0.0.0", port), Handler)
     lan_ip = get_lan_ip()
-
     # ============启动pyngrok隧道，实现不同网络访问 ============
     public_url = None
     if NGROK_AVAILABLE:
@@ -984,7 +1054,6 @@ def main() -> None:
             print(f"⚠️ 外网隧道启动失败：{ex}，仅局域网可用")
     else:
         print("💡未安装pyngrok，只能同一wifi局域网访问；执行 pip install pyngrok 开启跨网访问")
-
     print("=" * 70)
     print("  🎯猜数字游戏 · Web多端版")
     print("=" * 70)
@@ -992,19 +1061,18 @@ def main() -> None:
     print(f"  ✅同WiFi手机：  http://{lan_ip}:{port}")
     if public_url:
         print(f"  ✅外网跨网络：  {public_url}")
-    print(f"  📂数据目录：    {DATA_DIR}")
+    print(f"  📂当前数据目录：{DATA_DIR}")
+    print("  💡修改记录保存路径：设置环境变量 GUESS_GAME_DATA_DIR=你的文件夹路径，重启程序")
     print()
     print("  ⚠️ 同WiFi：手机连同一个wifi，输入局域网地址")
     print("  ⚠️ 跨不同网络：复制【外网跨网络】链接发给手机（苹果/华为都可以浏览器打开）")
     print("  ⚠️ Windows防火墙弹出，请允许访问网络")
     print("  Ctrl+C 停止服务")
     print("=" * 70)
-
     try:
         webbrowser.open(f"http://127.0.0.1:{port}")
     except Exception:
         pass
-
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
@@ -1018,7 +1086,5 @@ def main() -> None:
             httpd.server_close()
         except Exception:
             pass
-
-
 if __name__ == "__main__":
     main()
