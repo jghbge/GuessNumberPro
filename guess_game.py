@@ -5,6 +5,7 @@
 ✅支持Windows、Mac(苹果)、华为安卓手机
 ✅支持【同一局域网】+【跨不同网络外网访问】(pyngrok内网穿透)
 ✅新增：网页左下角设置弹窗：切换主题颜色、修改记录保存位置
+✅新增：HTML原生调色盘，自定义十六进制主色调
 打包命令：
     pip install pyngrok
     pyinstaller --onefile --name GuessGame --console guess_game_web.py
@@ -30,6 +31,7 @@ import webbrowser
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
+
 # ============ 新增：pyngrok内网穿透 实现跨不同网络访问 ============
 NGROK_AVAILABLE = False
 try:
@@ -37,22 +39,28 @@ try:
     NGROK_AVAILABLE = True
 except ImportError:
     pass
+
 # ============================================================
 # 加密存储（与原版一致：XOR + HMAC）
 # ============================================================
 SECRET_KEY = "guess_game_secret_key_#2024@secure!"
+
 def _key_bytes() -> bytes:
     return hashlib.sha256(SECRET_KEY.encode("utf-8")).digest()
+
 def _xor(data: bytes, key: bytes) -> bytes:
     return bytes(b ^ key[i % len(key)] for i, b in enumerate(data))
+
 def _mac(cipher: bytes) -> str:
     return hmac.new(_key_bytes(), cipher, hashlib.sha256).hexdigest()
+
 def encrypt_text(text: str) -> str:
     cipher = _xor(text.encode("utf-8"), _key_bytes())
     payload = {"c": base64.b64encode(cipher).decode("ascii"), "m": _mac(cipher)}
     return base64.b64encode(
         json.dumps(payload, ensure_ascii=False).encode("utf-8")
     ).decode("ascii")
+
 def decrypt_text(token: str) -> str:
     raw = base64.b64decode(token.encode("ascii"))
     payload = json.loads(raw.decode("utf-8"))
@@ -65,7 +73,7 @@ def decrypt_text(token: str) -> str:
 # 数据目录（支持环境变量GUESS_GAME_DATA_DIR自定义路径）
 # ============================================================
 def get_data_dir() -> str:
-    env_path = os.environ.get("GUESS_GAME_DATA_DIR","")
+    env_path = os.environ.get("GUESS_GAME_DATA_DIR", "")
     if env_path.strip() and os.path.isdir(env_path.strip()):
         return env_path.strip()
     if os.name == "nt":
@@ -92,6 +100,7 @@ def ensure_dirs() -> None:
 # 记录读写
 # ============================================================
 _records_lock = threading.Lock()
+
 def _read_records_unlocked():
     if not os.path.exists(RECORDS_FILE):
         return []
@@ -110,6 +119,7 @@ def _read_records_unlocked():
         except OSError:
             pass
         return []
+
 def _write_records_unlocked(records) -> None:
     ensure_dirs()
     token = encrypt_text(json.dumps(records, ensure_ascii=False))
@@ -124,9 +134,11 @@ def _write_records_unlocked(records) -> None:
         except OSError:
             pass
         raise
+
 def load_records():
     with _records_lock:
         return _read_records_unlocked()
+
 def append_record(record) -> bool:
     with _records_lock:
         records = _read_records_unlocked()
@@ -145,8 +157,10 @@ LEVELS = {
     "2": {"name": "中等", "max_num": 10000, "max_attempts": 30},
     "3": {"name": "困难", "max_num": 100000, "max_attempts": 40},
 }
+
 _games: dict = {}
 _games_lock = threading.Lock()
+
 def _resolve_level(level: str, payload: dict):
     if level in LEVELS:
         c = LEVELS[level]
@@ -163,6 +177,7 @@ def _resolve_level(level: str, payload: dict):
             raise ValueError("猜测次数至少为 1")
         return f"自定义(1-{max_num}, {max_att}次)", max_num, max_att
     raise ValueError("难度无效")
+
 def _snapshot(g: dict) -> dict:
     attempts = len(g["guesses"])
     return {
@@ -179,6 +194,7 @@ def _snapshot(g: dict) -> dict:
         "finished": g["finished"],
         "answer": g["answer"] if g["finished"] else None,
     }
+
 def new_game(level: str, payload: dict) -> dict:
     name, max_num, max_att = _resolve_level(level, payload)
     answer = random.randint(1, max_num)
@@ -199,6 +215,7 @@ def new_game(level: str, payload: dict) -> dict:
     with _games_lock:
         _games[gid] = game
     return _snapshot(game)
+
 def submit_guess(gid: str, value: int) -> dict:
     record = None
     with _games_lock:
@@ -250,6 +267,7 @@ def submit_guess(gid: str, value: int) -> dict:
     if record:
         append_record(record)
     return result
+
 def history_page(page: int, size: int) -> dict:
     records = list(reversed(load_records()))  # 最新在前
     total = len(records)
@@ -273,6 +291,7 @@ def history_page(page: int, size: int) -> dict:
             "time": r["time"],
         })
     return {"page": page, "pages": pages, "total": total, "items": items}
+
 def stats() -> dict:
     records = load_records()
     total = len(records)
@@ -308,6 +327,7 @@ def export_csv(records) -> str:
             r["answer"], r["attempts"], r["max_attempts"], pct, guesses,
         ])
     return buf.getvalue()
+
 def export_html(records) -> str:
     parts = [
         "<!DOCTYPE html>",
@@ -348,7 +368,7 @@ def export_html(records) -> str:
     return "\n".join(parts)
 
 # ============================================================
-# 前端页面（新增设置弹窗、主题颜色）
+# 前端页面（已集成自定义调色盘）
 # ============================================================
 HTML_PAGE = r"""<!DOCTYPE html>
 <html lang="zh-CN">
@@ -433,7 +453,7 @@ label:first-child{margin-top:0}
   font-size:26px;font-weight:700;margin:10px 0}
 .bar{height:6px;border-radius:3px;background:var(--bg-main);overflow:hidden}
 .bar i{display:block;height:100%;width:0;
-  background:linear-gradient(90deg,#4f8cff,#38d39f);transition:width .25s}
+  background:linear-gradient(90deg,var(--primary),#38d39f);transition:width .25s}
 .feedback{min-height:44px;display:flex;align-items:center;
   font-size:15px;color:var(--text-muted);margin-bottom:10px}
 .feedback.low{color:#8fbcff}.feedback.high{color:#ffc861}
@@ -481,7 +501,6 @@ label:first-child{margin-top:0}
 .tab{border:0;background:transparent;color:var(--text-muted);padding:12px 4px;
   font-size:13px;cursor:pointer;min-height:52px}
 .tab.active{color:var(--primary);font-weight:700}
-
 /* ========== 设置按钮与弹窗 ========== */
 #setting-btn{
   position:fixed;
@@ -527,6 +546,16 @@ label:first-child{margin-top:0}
   width:36px;height:36px;border-radius:8px;cursor:pointer;border:2px solid transparent;
 }
 .color-item.active{border-color:#fff;box-shadow:0 0 0 2px var(--primary)}
+.color-input-wrap{
+  display:flex;gap:10px;align-items:center;margin-top:10px;
+}
+#color-picker{
+  width:44px;height:44px;border:none;border-radius:8px;cursor:pointer;padding:0;
+}
+#color-hex{
+  flex:1;padding:10px 12px;border-radius:8px;background:var(--bg-main);
+  border:1px solid var(--border-color);color:var(--text-normal);font-size:15px;
+}
 </style>
 </head>
 <body>
@@ -609,10 +638,8 @@ label:first-child{margin-top:0}
     </div>
   </section>
 </main>
-
 <!-- 设置按钮 -->
 <button id="setting-btn">⚙️</button>
-
 <!-- 设置弹窗 -->
 <div id="setting-modal" class="hidden">
   <div class="modal-inner">
@@ -626,13 +653,17 @@ label:first-child{margin-top:0}
         <button class="btn" id="theme-dark">暗色主题</button>
         <button class="btn" id="theme-light">亮色主题</button>
       </div>
-      <label style="margin-top:14px">主色调选择</label>
+      <label style="margin-top:14px">主色调选择（预设 / 自定义调色盘）</label>
       <div class="color-pick-row" id="color-list">
         <div class="color-item" data-color="#4f8cff" style="background:#4f8cff"></div>
         <div class="color-item" data-color="#22bb88" style="background:#22bb88"></div>
         <div class="color-item" data-color="#dd5555" style="background:#dd5555"></div>
         <div class="color-item" data-color="#aa55dd" style="background:#aa55dd"></div>
         <div class="color-item" data-color="#dd9922" style="background:#dd9922"></div>
+      </div>
+      <div class="color-input-wrap">
+        <input type="color" id="color-picker" value="#4f8cff">
+        <input id="color-hex" placeholder="#RRGGBB 十六进制颜色" maxlength="7">
       </div>
     </div>
     <div class="card">
@@ -642,7 +673,6 @@ label:first-child{margin-top:0}
     </div>
   </div>
 </div>
-
 <nav class="tabbar">
   <button class="tab active" data-view="menu">开始</button>
   <button class="tab" data-view="history">历史</button>
@@ -654,7 +684,6 @@ label:first-child{margin-top:0}
 "use strict";
 var $=function(id){return document.getElementById(id)};
 var state={view:"menu",game:null,lastLevel:null,lastExtra:null,historyPage:1};
-
 // ========== 主题本地存储 ==========
 const THEME_KEY = "guessgame_theme";
 const COLOR_KEY = "guessgame_primary";
@@ -664,13 +693,18 @@ function loadTheme(){
   applyTheme(savedTheme, savedColor);
 }
 function applyTheme(mode, color){
+  if(!/^#[0-9A-Fa-f]{6}$/.test(color)){
+      color="#4f8cff";
+  }
   if(mode==="light"){
     document.documentElement.classList.add("light-theme");
   }else{
     document.documentElement.classList.remove("light-theme");
   }
   document.documentElement.style.setProperty("--primary",color);
-  // 简单自动生成深色变体
+  $("color-picker").value = color;
+  $("color-hex").value = color.toUpperCase();
+
   let r=parseInt(color.slice(1,3),16);
   let g=parseInt(color.slice(3,5),16);
   let b=parseInt(color.slice(5,7),16);
@@ -681,12 +715,10 @@ function applyTheme(mode, color){
   document.documentElement.style.setProperty("--primary-dark",darkColor);
   localStorage.setItem(THEME_KEY,mode);
   localStorage.setItem(COLOR_KEY,color);
-  // 更新选中标记
   Array.from(document.querySelectorAll(".color-item")).forEach(el=>{
     el.classList.toggle("active",el.dataset.color===color);
   })
 }
-
 var settingModal = $("setting-modal");
 function openSetting(){
   settingModal.classList.remove("hidden");
@@ -694,7 +726,6 @@ function openSetting(){
 function closeSetting(){
   settingModal.classList.add("hidden");
 }
-
 function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,function(c){
   return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]})}
 function setStatus(t,c){var e=$("status");e.textContent=t;e.className="status"+(c?" "+c:"")}
@@ -864,7 +895,6 @@ function bind(){
                            "&scope="+encodeURIComponent(scope);
       setTimeout(function(){setStatus("就绪")},1500);
     })});
-
   // 设置弹窗绑定
   $("setting-btn").addEventListener("click",openSetting);
   $("setting-close").addEventListener("click",closeSetting);
@@ -878,6 +908,19 @@ function bind(){
       applyTheme(localStorage.getItem(THEME_KEY)||"dark",el.dataset.color);
     }
   })
+  //=====新增调色盘事件绑定====
+  $("color-picker").addEventListener("input",function(){
+      applyTheme(localStorage.getItem(THEME_KEY)||"dark", this.value);
+  });
+  $("color-hex").addEventListener("change",function(){
+      let val=this.value.trim();
+      if(!val.startsWith("#")) val="#"+val;
+      if(/^#[0-9A-Fa-f]{6}$/.test(val)){
+          applyTheme(localStorage.getItem(THEME_KEY)||"dark",val);
+      }else{
+          alert("请输入合法十六进制颜色，例如 #4f8cff");
+      }
+  });
 }
 function init(){
   bind();
@@ -1023,6 +1066,7 @@ def get_lan_ip() -> str:
         return "127.0.0.1"
     finally:
         s.close()
+
 def find_port(start: int = 8000, tries: int = 30) -> int:
     for port in range(start, start + tries):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -1033,6 +1077,7 @@ def find_port(start: int = 8000, tries: int = 30) -> int:
             except OSError:
                 continue
     raise RuntimeError("找不到可用端口")
+
 def main() -> None:
     try:
         ensure_dirs()
@@ -1086,5 +1131,6 @@ def main() -> None:
             httpd.server_close()
         except Exception:
             pass
+
 if __name__ == "__main__":
     main()
