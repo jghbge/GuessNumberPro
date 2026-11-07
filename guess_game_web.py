@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-猜数字游戏 · Web 版（PC / 手机通用）+ 设置面板
-打包：pyinstaller --onefile --name GuessNumberPro --console guess_game_web.py
+================================================================================
+                                GuessNumberPro
+                     猜数字游戏 · 高阶 Web 全功能版
+================================================================================
 """
 
 import base64
@@ -14,35 +16,34 @@ import io
 import json
 import os
 import random
+import re
 import shutil
 import socket
+import subprocess
 import sys
 import tempfile
 import threading
 import uuid
 import webbrowser
+import time
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 
-# ============================================================
-# 加密存储
-# ============================================================
+# ==============================================================================
+# 模块：加密与安全 (Security & Cryptography)
+# ==============================================================================
 SECRET_KEY = "guess_game_secret_key_#2024@secure!"
-
 
 def _key_bytes() -> bytes:
     return hashlib.sha256(SECRET_KEY.encode("utf-8")).digest()
 
-
 def _xor(data: bytes, key: bytes) -> bytes:
     return bytes(b ^ key[i % len(key)] for i, b in enumerate(data))
 
-
 def _mac(cipher: bytes) -> str:
     return hmac.new(_key_bytes(), cipher, hashlib.sha256).hexdigest()
-
 
 def encrypt_text(text: str) -> str:
     cipher = _xor(text.encode("utf-8"), _key_bytes())
@@ -51,32 +52,28 @@ def encrypt_text(text: str) -> str:
         json.dumps(payload, ensure_ascii=False).encode("utf-8")
     ).decode("ascii")
 
-
 def decrypt_text(token: str) -> str:
     raw = base64.b64decode(token.encode("ascii"))
     payload = json.loads(raw.decode("utf-8"))
     cipher = base64.b64decode(payload["c"].encode("ascii"))
     if not hmac.compare_digest(payload.get("m", ""), _mac(cipher)):
-        raise ValueError("数据校验失败")
+        raise ValueError("数据校验失败，可能被篡改")
     return _xor(cipher, _key_bytes()).decode("utf-8")
 
 
-# ============================================================
-# 路径 & 配置（支持运行时切换数据目录）
-# ============================================================
+# ==============================================================================
+# 模块：路径与配置管理 (Path & Config)
+# ==============================================================================
 def _default_base() -> str:
     if os.name == "nt":
         base = os.environ.get("APPDATA") or os.path.expanduser("~")
     elif sys.platform == "darwin":
-        base = os.path.join(os.path.expanduser("~"),
-                            "Library", "Application Support")
+        base = os.path.join(os.path.expanduser("~"), "Library", "Application Support")
     else:
-        base = os.environ.get("XDG_DATA_HOME") or \
-               os.path.join(os.path.expanduser("~"), ".local", "share")
+        base = os.environ.get("XDG_DATA_HOME") or os.path.join(os.path.expanduser("~"), ".local", "share")
     if not base or base == "~":
         base = tempfile.gettempdir()
     return base
-
 
 DEFAULT_BASE = _default_base()
 CONFIG_DIR = os.path.join(DEFAULT_BASE, "GuessGame")
@@ -86,7 +83,6 @@ _config_lock = threading.Lock()
 _paths_lock = threading.Lock()
 _paths = {"data_dir": None}
 
-
 def _read_config() -> dict:
     try:
         with open(CONFIG_FILE, "r", encoding="utf-8") as f:
@@ -95,14 +91,12 @@ def _read_config() -> dict:
     except Exception:
         return {}
 
-
 def _write_config(cfg: dict) -> None:
     os.makedirs(CONFIG_DIR, exist_ok=True)
     tmp = CONFIG_FILE + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(cfg, f, ensure_ascii=False, indent=2)
     os.replace(tmp, CONFIG_FILE)
-
 
 def get_data_dir() -> str:
     with _paths_lock:
@@ -113,30 +107,21 @@ def get_data_dir() -> str:
             _paths["data_dir"] = d
         return _paths["data_dir"]
 
-
 def records_file() -> str:
     return os.path.join(get_data_dir(), "records.dat")
 
-
 def export_dir() -> str:
     return os.path.join(get_data_dir(), "exports")
-
 
 def ensure_dirs() -> None:
     os.makedirs(get_data_dir(), exist_ok=True)
     os.makedirs(export_dir(), exist_ok=True)
 
-
 def change_data_dir(raw_path: str) -> dict:
-    """更改数据目录并迁移现有记录。"""
     raw = (raw_path or "").strip()
     if not raw:
         raise ValueError("路径不能为空")
     new_dir = os.path.abspath(os.path.expanduser(raw))
-
-    if not os.path.isabs(new_dir):
-        raise ValueError("请提供绝对路径")
-
     try:
         os.makedirs(new_dir, exist_ok=True)
         test = os.path.join(new_dir, ".write_test")
@@ -158,10 +143,7 @@ def change_data_dir(raw_path: str) -> dict:
         if os.path.exists(new_records):
             stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             try:
-                os.replace(
-                    new_records,
-                    os.path.join(new_dir, f"records.pre_migrate_{stamp}.dat"),
-                )
+                os.replace(new_records, os.path.join(new_dir, f"records.pre_migrate_{stamp}.dat"))
             except OSError:
                 pass
         try:
@@ -174,23 +156,19 @@ def change_data_dir(raw_path: str) -> dict:
         cfg = _read_config()
         cfg["data_dir"] = new_dir
         _write_config(cfg)
-
     with _paths_lock:
         _paths["data_dir"] = new_dir
-
     try:
         os.makedirs(os.path.join(new_dir, "exports"), exist_ok=True)
     except OSError:
         pass
-
     return {"data_dir": new_dir, "migrated": migrated, "same": False}
 
 
-# ============================================================
-# 记录读写
-# ============================================================
+# ==============================================================================
+# 模块：记录读写与游戏逻辑 (Records & Game Logic)
+# ==============================================================================
 _records_lock = threading.Lock()
-
 
 def _read_records_unlocked() -> list:
     path = records_file()
@@ -212,7 +190,6 @@ def _read_records_unlocked() -> list:
             pass
         return []
 
-
 def _write_records_unlocked(records: list) -> None:
     ensure_dirs()
     token = encrypt_text(json.dumps(records, ensure_ascii=False))
@@ -229,11 +206,9 @@ def _write_records_unlocked(records: list) -> None:
             pass
         raise
 
-
 def load_records() -> list:
     with _records_lock:
         return _read_records_unlocked()
-
 
 def append_record(record: dict) -> bool:
     with _records_lock:
@@ -245,10 +220,6 @@ def append_record(record: dict) -> bool:
         except OSError:
             return False
 
-
-# ============================================================
-# 游戏逻辑
-# ============================================================
 LEVELS = {
     "1": {"name": "简单", "max_num": 1000, "max_attempts": 20},
     "2": {"name": "中等", "max_num": 10000, "max_attempts": 30},
@@ -257,7 +228,6 @@ LEVELS = {
 
 _games: dict = {}
 _games_lock = threading.Lock()
-
 
 def _resolve_level(level: str, payload: dict):
     if level in LEVELS:
@@ -276,24 +246,15 @@ def _resolve_level(level: str, payload: dict):
         return f"自定义(1-{max_num}, {max_att}次)", max_num, max_att
     raise ValueError("难度无效")
 
-
 def _snapshot(g: dict) -> dict:
     attempts = len(g["guesses"])
     return {
-        "id": g["id"],
-        "name": g["name"],
-        "max_num": g["max_num"],
-        "max_attempts": g["max_attempts"],
-        "low": g["low"],
-        "high": g["high"],
-        "attempts": attempts,
-        "remaining": g["max_attempts"] - attempts,
-        "guesses": list(g["guesses"]),
-        "marks": list(g["marks"]),
-        "finished": g["finished"],
-        "answer": g["answer"] if g["finished"] else None,
+        "id": g["id"], "name": g["name"], "max_num": g["max_num"],
+        "max_attempts": g["max_attempts"], "low": g["low"], "high": g["high"],
+        "attempts": attempts, "remaining": g["max_attempts"] - attempts,
+        "guesses": list(g["guesses"]), "marks": list(g["marks"]),
+        "finished": g["finished"], "answer": g["answer"] if g["finished"] else None,
     }
-
 
 def new_game(level: str, payload: dict) -> dict:
     name, max_num, max_att = _resolve_level(level, payload)
@@ -309,7 +270,6 @@ def new_game(level: str, payload: dict) -> dict:
     with _games_lock:
         _games[gid] = game
     return _snapshot(game)
-
 
 def submit_guess(gid: str, value: int) -> dict:
     record = None
@@ -349,9 +309,7 @@ def submit_guess(gid: str, value: int) -> dict:
 
         result = _snapshot(g)
         result["direction"] = direction
-        result["percent"] = (
-            attempts / g["max_attempts"] * 100 if g["win"] else None
-        )
+        result["percent"] = attempts / g["max_attempts"] * 100 if g["win"] else None
 
         if g["finished"]:
             record = {
@@ -367,7 +325,6 @@ def submit_guess(gid: str, value: int) -> dict:
         append_record(record)
     return result
 
-
 def history_page(page: int, size: int) -> dict:
     records = list(reversed(load_records()))
     total = len(records)
@@ -377,21 +334,14 @@ def history_page(page: int, size: int) -> dict:
     items = []
     for i, r in enumerate(records[start:start + size]):
         items.append({
-            "no": total - (start + i),
-            "win": r["win"],
-            "level_name": r["level_name"],
-            "answer": r["answer"],
-            "attempts": r["attempts"],
-            "max_attempts": r["max_attempts"],
-            "percent": (
-                f"{r['attempts'] / r['max_attempts'] * 100:.2f}%"
-                if r["win"] and r["max_attempts"] else ""
-            ),
-            "guesses": r["guesses"],
-            "time": r["time"],
+            "no": total - (start + i), "win": r["win"],
+            "level_name": r["level_name"], "answer": r["answer"],
+            "attempts": r["attempts"], "max_attempts": r["max_attempts"],
+            "percent": (f"{r['attempts'] / r['max_attempts'] * 100:.2f}%"
+                        if r["win"] and r["max_attempts"] else ""),
+            "guesses": r["guesses"], "time": r["time"],
         })
     return {"page": page, "pages": pages, "total": total, "items": items}
-
 
 def stats() -> dict:
     records = load_records()
@@ -409,9 +359,9 @@ def stats() -> dict:
     }
 
 
-# ============================================================
-# 导出
-# ============================================================
+# ==============================================================================
+# 模块：数据导出 (Data Export)
+# ==============================================================================
 def export_csv(records) -> str:
     buf = io.StringIO()
     w = csv.writer(buf)
@@ -421,18 +371,13 @@ def export_csv(records) -> str:
         pct = (f"{r['attempts'] / r['max_attempts'] * 100:.2f}%"
                if r["win"] and r["max_attempts"] else "")
         guesses = " -> ".join(map(str, r["guesses"])) if r["guesses"] else ""
-        w.writerow([
-            i, r["time"], r["level_name"],
-            "猜对" if r["win"] else "失败",
-            r["answer"], r["attempts"], r["max_attempts"], pct, guesses,
-        ])
+        w.writerow([i, r["time"], r["level_name"], "猜对" if r["win"] else "失败",
+                    r["answer"], r["attempts"], r["max_attempts"], pct, guesses])
     return buf.getvalue()
-
 
 def export_html(records) -> str:
     parts = [
-        "<!DOCTYPE html>",
-        "<html lang='zh-CN'><head><meta charset='utf-8'>",
+        "<!DOCTYPE html>", "<html lang='zh-CN'><head><meta charset='utf-8'>",
         "<title>猜数字游戏历史记录</title>",
         "<style>",
         "body{font-family:'Microsoft YaHei',Arial,sans-serif;margin:20px}",
@@ -440,44 +385,39 @@ def export_html(records) -> str:
         "th,td{border:1px solid #999;padding:6px 10px;text-align:center}",
         "th{background:#f0f0f0}tr:nth-child(even){background:#fafafa}",
         ".win{color:green;font-weight:bold}.lose{color:red;font-weight:bold}",
-        "</style></head><body>",
-        "<h1>猜数字游戏历史记录</h1>",
-        f"<p>导出时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}，"
-        f"共 {len(records)} 条记录</p>",
-        "<table><tr>"
-        "<th>序号</th><th>时间</th><th>难度</th><th>结果</th>"
-        "<th>正确答案</th><th>使用次数</th><th>最大次数</th>"
-        "<th>使用次数百分比</th><th>猜测序列</th>"
-        "</tr>",
+        "</style></head><body>", "<h1>猜数字游戏历史记录</h1>",
+        f"<p>导出时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}，共 {len(records)} 条记录</p>",
+        "<table><tr><th>序号</th><th>时间</th><th>难度</th><th>结果</th>"
+        "<th>正确答案</th><th>使用次数</th><th>最大次数</th><th>使用次数百分比</th><th>猜测序列</th></tr>",
     ]
     for i, r in enumerate(records, 1):
         cls = "win" if r["win"] else "lose"
         status = "猜对" if r["win"] else "失败"
         pct = (f"{r['attempts'] / r['max_attempts'] * 100:.2f}%"
                if r["win"] and r["max_attempts"] else "")
-        guesses = (" -> ".join(map(str, r["guesses"]))
-                   if r["guesses"] else "")
+        guesses = (" -> ".join(map(str, r["guesses"])) if r["guesses"] else "")
         parts.append(
             f"<tr><td>{i}</td><td>{html.escape(r['time'])}</td>"
-            f"<td>{html.escape(r['level_name'])}</td>"
-            f"<td class='{cls}'>{status}</td>"
-            f"<td>{r['answer']}</td><td>{r['attempts']}</td>"
-            f"<td>{r['max_attempts']}</td><td>{pct}</td>"
-            f"<td>{html.escape(guesses)}</td></tr>"
+            f"<td>{html.escape(r['level_name'])}</td><td class='{cls}'>{status}</td>"
+            f"<td>{r['answer']}</td><td>{r['attempts']}</td><td>{r['max_attempts']}</td>"
+            f"<td>{pct}</td><td>{html.escape(guesses)}</td></tr>"
         )
     parts.append("</table></body></html>")
     return "\n".join(parts)
 
 
-# ============================================================
-# 前端页面（内嵌）
-# ============================================================
+# ==============================================================================
+# 模块：前端页面内嵌 (Frontend HTML)
+# ==============================================================================
+FAVICON_B64 = "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI+PGNpcmNsZSBjeD0iMTIiIGN5PSIxMiIgcj0iMTAiIGZpbGw9Im5vbmUiIHN0cm9rZT0iIzRmOGNmZiIgc3Ryb2tlLXdpZHRoPSIyIi8+PGNpcmNsZSBjeD0iMTIiIGN5PSIxMiIgcj0iNiIgZmlsbD0ibm9uZSIgc3Ryb2tlPSIjNGY4Y2ZmIiBzdHJva2Utd2lkdGg9IjIiLz48Y2lyY2xlIGN4PSIxMiIgY3k9IjEyIiByPSIyIiBmaWxsPSIjNGY4Y2ZmIi8+PC9zdmc+"
+
 HTML_PAGE = r"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="theme-color" content="#0b1220">
+<link rel="icon" href="%FAVICON%">
 <title>猜数字游戏</title>
 <style>
 :root{
@@ -574,9 +514,12 @@ label:first-child{margin-top:0}
 
 .list{display:flex;flex-direction:column;gap:10px}
 .list-item{background:var(--bg-card);border:1px solid var(--border);
-  border-left:4px solid var(--border-strong);border-radius:12px;padding:12px 14px}
+  border-left:4px solid var(--border-strong);border-radius:12px;padding:12px 14px;
+  display:flex;gap:12px;align-items:flex-start}
 .list-item.win{border-left-color:var(--success)}
 .list-item.lose{border-left-color:var(--danger)}
+.list-item input[type=checkbox]{width:20px;height:20px;margin-top:4px;cursor:pointer;accent-color:var(--primary)}
+.li-content{flex:1;min-width:0}
 .li-head{display:flex;justify-content:space-between;align-items:center;
   gap:8px;margin-bottom:6px}
 .li-row{display:flex;justify-content:space-between;gap:12px;
@@ -586,6 +529,8 @@ label:first-child{margin-top:0}
 .tag{font-size:12px;padding:2px 8px;border-radius:999px;border:1px solid}
 .tag.ok{color:var(--success);border-color:var(--success)}
 .tag.bad{color:var(--danger);border-color:var(--danger)}
+
+.toolbar{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}
 .pager{display:flex;align-items:center;justify-content:space-between;
   gap:10px;margin-top:14px}
 .pager .btn{min-height:42px;padding:0 14px;font-size:14px}
@@ -606,7 +551,6 @@ label:first-child{margin-top:0}
   font-size:13px;cursor:pointer;min-height:52px;font-family:inherit}
 .tab.active{color:var(--primary);font-weight:700}
 
-/* ---- 设置图标（左下角浮动） ---- */
 .settings-fab{position:fixed;left:16px;z-index:60;
   bottom:calc(76px + env(safe-area-inset-bottom));
   width:50px;height:50px;border-radius:50%;
@@ -617,7 +561,6 @@ label:first-child{margin-top:0}
 .settings-fab:active{transform:scale(.93)}
 .settings-fab svg{width:24px;height:24px}
 
-/* ---- 设置抽屉 ---- */
 .settings-drawer{position:fixed;inset:0;z-index:100;pointer-events:none}
 .settings-drawer.open{pointer-events:auto}
 .settings-backdrop{position:absolute;inset:0;background:rgba(0,0,0,.45);
@@ -657,7 +600,6 @@ label:first-child{margin-top:0}
 .color-swatch::after{content:"";position:absolute;inset:0;
   background:linear-gradient(135deg,transparent 40%,rgba(255,255,255,.35) 100%)}
 
-/* ---- 颜色选择器 ---- */
 .picker-overlay{position:fixed;inset:0;z-index:200;background:rgba(0,0,0,.55);
   display:none;align-items:center;justify-content:center;padding:16px;
   padding-top:calc(16px + env(safe-area-inset-top));
@@ -755,7 +697,13 @@ label:first-child{margin-top:0}
   </section>
 
   <section class="view hidden" id="view-history">
-    <h2 class="title">历史记录（最新在前）</h2>
+    <div class="toolbar">
+      <h2 class="title" style="margin:0">历史记录</h2>
+      <div class="row">
+        <button class="btn ghost small" id="btn-select-all">全选本页</button>
+        <button class="btn ghost small" id="btn-unselect-all">取消全选</button>
+      </div>
+    </div>
     <div id="history-list" class="list"></div>
     <div class="pager">
       <button class="btn ghost" id="h-prev">上一页</button>
@@ -778,12 +726,14 @@ label:first-child{margin-top:0}
         <option value="recent">最近 10 条</option>
         <option value="win">仅猜对</option>
         <option value="lose">仅失败</option>
+        <option value="selected">⚠️ 仅导出在“历史”页勾选的记录</option>
       </select>
       <div class="btn-row">
         <button class="btn primary" data-export="csv">导出 CSV</button>
         <button class="btn primary" data-export="html">导出 HTML</button>
       </div>
-      <p class="hint">CSV 用 WPS / Excel 打开；HTML 用浏览器打开。</p>
+      <p class="hint">CSV 用 WPS / Excel 打开；HTML 用浏览器打开。<br>
+      选“仅导出勾选”时，请先在历史页勾选数据。</p>
     </div>
   </section>
 </main>
@@ -795,7 +745,6 @@ label:first-child{margin-top:0}
   <button class="tab" data-view="export">导出</button>
 </nav>
 
-<!-- 设置图标 -->
 <button class="settings-fab" id="btn-settings" aria-label="设置">
   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
        stroke-linecap="round" stroke-linejoin="round">
@@ -804,7 +753,6 @@ label:first-child{margin-top:0}
   </svg>
 </button>
 
-<!-- 设置抽屉 -->
 <div class="settings-drawer" id="settings-drawer">
   <div class="settings-backdrop" id="settings-backdrop"></div>
   <aside class="settings-panel">
@@ -821,25 +769,11 @@ label:first-child{margin-top:0}
           <button data-mode="custom">自定义</button>
         </div>
         <div id="theme-custom" class="hidden" style="margin-top:10px">
-          <div class="color-row">
-            <span>背景色</span>
-            <button class="color-swatch" data-theme-key="bg"></button>
-          </div>
-          <div class="color-row">
-            <span>卡片色</span>
-            <button class="color-swatch" data-theme-key="card"></button>
-          </div>
-          <div class="color-row">
-            <span>文字色</span>
-            <button class="color-swatch" data-theme-key="text"></button>
-          </div>
-          <div class="color-row">
-            <span>主色调</span>
-            <button class="color-swatch" data-theme-key="primary"></button>
-          </div>
-          <button class="btn ghost block" id="btn-theme-reset" style="margin-top:8px">
-            恢复默认自定义值
-          </button>
+          <div class="color-row"><span>背景色</span><button class="color-swatch" data-theme-key="bg"></button></div>
+          <div class="color-row"><span>卡片色</span><button class="color-swatch" data-theme-key="card"></button></div>
+          <div class="color-row"><span>文字色</span><button class="color-swatch" data-theme-key="text"></button></div>
+          <div class="color-row"><span>主色调</span><button class="color-swatch" data-theme-key="primary"></button></div>
+          <button class="btn ghost block" id="btn-theme-reset" style="margin-top:8px">恢复默认自定义值</button>
         </div>
       </section>
 
@@ -859,13 +793,12 @@ label:first-child{margin-top:0}
         <h3>数据目录</h3>
         <p class="small muted" id="data-dir-current" style="word-break:break-all;margin:0 0 10px">加载中…</p>
         <button class="btn primary block" id="btn-change-dir">更改数据目录</button>
-        <p class="hint">更改后会把现有记录迁移到新目录（原目录记录会保留作备份）。</p>
+        <p class="hint">更改后会把现有记录迁移到新目录。</p>
       </section>
     </div>
   </aside>
 </div>
 
-<!-- 颜色选择器 -->
 <div class="picker-overlay" id="picker-overlay">
   <div class="picker-panel">
     <header>
@@ -912,9 +845,6 @@ label:first-child{margin-top:0}
 "use strict";
 var $=function(id){return document.getElementById(id)};
 
-/* ============================================================
- * 颜色工具
- * ============================================================ */
 function clamp(v,a,b){return Math.max(a,Math.min(b,v))}
 function hexToRgb(hex){
   var m=/^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex);
@@ -963,11 +893,7 @@ function rgbToHsl(hex){
   return{h:h,s:s,l:l};
 }
 
-/* ============================================================
- * 设置存储
- * ============================================================ */
 var SETTINGS_KEY="guess_number_pro_settings_v1";
-
 var FONTS=[
   {name:"系统默认",css:'-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif'},
   {name:"微软雅黑",css:'"Microsoft YaHei",sans-serif'},
@@ -990,13 +916,11 @@ var FONTS=[
   {name:"Courier New",css:'"Courier New",Courier,monospace'},
   {name:"Consolas",css:'Consolas,Menlo,monospace'}
 ];
-
 var DEFAULT_SETTINGS={
   theme:{mode:"dark"},
   customTheme:{bg:"#0b1220",card:"#16213a",text:"#e8eefc",primary:"#4f8cff"},
   font:{familyIndex:0,size:16,color:"#e8eefc"}
 };
-
 function loadSettings(){
   try{
     var raw=localStorage.getItem(SETTINGS_KEY);
@@ -1009,174 +933,95 @@ function loadSettings(){
     };
   }catch(e){return JSON.parse(JSON.stringify(DEFAULT_SETTINGS))}
 }
-function saveSettings(s){
-  try{localStorage.setItem(SETTINGS_KEY,JSON.stringify(s))}catch(e){}
-}
-
+function saveSettings(s){try{localStorage.setItem(SETTINGS_KEY,JSON.stringify(s))}catch(e){}}
 var settings=loadSettings();
 
-/* ============================================================
- * 主题应用
- * ============================================================ */
 function applyTheme(){
-  var root=document.documentElement.style;
-  var t=settings.theme;
-  var vars;
-
+  var root=document.documentElement.style,t=settings.theme,vars;
   if(t.mode==="light"){
-    vars={
-      "--bg":"#f4f6fb","--bg-card":"#ffffff","--bg-input":"#f0f3fa",
-      "--border":"#d8e0ee","--border-strong":"#c4d0e3",
-      "--text":"#1a2338","--text-muted":"#6b7a99",
-      "--primary":"#4f8cff","--primary-2":"#3b6fe0",
-      "--success":"#0fa76a","--danger":"#e5484d","--warning":"#d97706"
-    };
+    vars={"--bg":"#f4f6fb","--bg-card":"#ffffff","--bg-input":"#f0f3fa","--border":"#d8e0ee","--border-strong":"#c4d0e3","--text":"#1a2338","--text-muted":"#6b7a99","--primary":"#4f8cff","--primary-2":"#3b6fe0","--success":"#0fa76a","--danger":"#e5484d","--warning":"#d97706"};
     document.querySelector('meta[name="theme-color"]').setAttribute("content","#ffffff");
   }else if(t.mode==="custom"){
-    var c=settings.customTheme;
-    var card=c.card,bg=c.bg,text=c.text,pri=c.primary;
-    vars={
-      "--bg":bg,"--bg-card":card,
-      "--bg-input":mixColor(card,bg,0.55),
-      "--border":mixColor(card,text,0.14),
-      "--border-strong":mixColor(card,text,0.24),
-      "--text":text,"--text-muted":mixColor(text,bg,0.45),
-      "--primary":pri,"--primary-2":mixColor(pri,"#000000",0.22),
-      "--success":"#38d39f","--danger":"#ff6b6b","--warning":"#ffc861"
-    };
+    var c=settings.customTheme,card=c.card,bg=c.bg,text=c.text,pri=c.primary;
+    vars={"--bg":bg,"--bg-card":card,"--bg-input":mixColor(card,bg,0.55),"--border":mixColor(card,text,0.14),"--border-strong":mixColor(card,text,0.24),"--text":text,"--text-muted":mixColor(text,bg,0.45),"--primary":pri,"--primary-2":mixColor(pri,"#000000",0.22),"--success":"#38d39f","--danger":"#ff6b6b","--warning":"#ffc861"};
     document.querySelector('meta[name="theme-color"]').setAttribute("content",card);
   }else{
-    vars={
-      "--bg":"#0b1220","--bg-card":"#16213a","--bg-input":"#0f1830",
-      "--border":"#24334f","--border-strong":"#2a3a5c",
-      "--text":"#e8eefc","--text-muted":"#8fa3c8",
-      "--primary":"#4f8cff","--primary-2":"#3b6fe0",
-      "--success":"#38d39f","--danger":"#ff6b6b","--warning":"#ffc861"
-    };
+    vars={"--bg":"#0b1220","--bg-card":"#16213a","--bg-input":"#0f1830","--border":"#24334f","--border-strong":"#2a3a5c","--text":"#e8eefc","--text-muted":"#8fa3c8","--primary":"#4f8cff","--primary-2":"#3b6fe0","--success":"#38d39f","--danger":"#ff6b6b","--warning":"#ffc861"};
     document.querySelector('meta[name="theme-color"]').setAttribute("content","#0b1220");
   }
-
   Object.keys(vars).forEach(function(k){root.setProperty(k,vars[k])});
 }
-
 function applyFont(){
-  var f=settings.font;
-  var font=FONTS[f.familyIndex]||FONTS[0];
-  var root=document.documentElement.style;
+  var f=settings.font,font=FONTS[f.familyIndex]||FONTS[0],root=document.documentElement.style;
   root.setProperty("--font-family",font.css);
   root.setProperty("--font-size",f.size+"px");
   root.setProperty("--font-color",f.color);
 }
-
 function applyAll(){applyTheme();applyFont()}
 
-/* ============================================================
- * 设置面板 UI
- * ============================================================ */
 function openSettings(){
   $("settings-drawer").classList.add("open");
   document.body.style.overflow="hidden";
-  syncSettingsUI();
-  loadDataDirInfo();
+  syncSettingsUI();loadDataDirInfo();
 }
 function closeSettings(){
   $("settings-drawer").classList.remove("open");
   document.body.style.overflow="";
 }
-
 function syncSettingsUI(){
-  // 主题模式
   Array.prototype.forEach.call(document.querySelectorAll("#theme-mode button"),function(b){
     b.classList.toggle("on",b.dataset.mode===settings.theme.mode);
   });
-  // 自定义主题区显示
   $("theme-custom").classList.toggle("hidden",settings.theme.mode!=="custom");
-  // 主题色块
   Array.prototype.forEach.call(document.querySelectorAll("[data-theme-key]"),function(sw){
     sw.style.background=settings.customTheme[sw.dataset.themeKey];
   });
-  // 字体
   $("font-select").value=String(settings.font.familyIndex);
   $("font-size").value=settings.font.size;
   $("font-size-val").textContent=settings.font.size;
   $("font-color-swatch").style.background=settings.font.color;
 }
-
 function loadDataDirInfo(){
   fetch("/api/config").then(function(r){return r.json()}).then(function(d){
     $("data-dir-current").textContent=d.data_dir||"—";
   }).catch(function(){$("data-dir-current").textContent="无法获取"});
 }
 
-/* ============================================================
- * 颜色选择器
- * ============================================================ */
-var pickerState={
-  open:false,
-  color:"#000000",
-  light:50,
-  hue:0,
-  sat:0,
-  paletteCount:32,
-  onPick:null,
-  mixA:"#000000",
-  mixB:"#ffffff"
-};
-
+var pickerState={open:false,color:"#000000",light:50,hue:0,sat:0,paletteCount:32,onPick:null,mixA:"#000000",mixB:"#ffffff"};
 function buildPalette(count){
   var colors=[];
   if(count===32){
-    var hueSet=[0,45,90,135,180,225,270,315];
-    var levels=[30,50,70,90];
-    levels.forEach(function(l){
-      hueSet.forEach(function(h){colors.push(hslToHex(h,70,l))});
+    [0,45,90,135,180,225,270,315].forEach(function(h){
+      [30,50,70,90].forEach(function(l){colors.push(hslToHex(h,70,l))});
     });
   }else{
-    var hueSet2=[0,45,90,135,180,225,270,315];
-    var levels2=[40,75];
-    levels2.forEach(function(l){
-      hueSet2.forEach(function(h){colors.push(hslToHex(h,70,l))});
+    [0,45,90,135,180,225,270,315].forEach(function(h){
+      [40,75].forEach(function(l){colors.push(hslToHex(h,70,l))});
     });
   }
   return colors;
 }
-
 function drawWheel(){
-  var canvas=$("picker-wheel");
-  var ctx=canvas.getContext("2d");
-  var w=canvas.width,h=canvas.height;
-  var cx=w/2,cy=h/2,r=Math.min(w,h)/2-1;
-  var img=ctx.createImageData(w,h);
-  var data=img.data;
+  var canvas=$("picker-wheel"),ctx=canvas.getContext("2d"),w=canvas.width,h=canvas.height,cx=w/2,cy=h/2,r=Math.min(w,h)/2-1;
+  var img=ctx.createImageData(w,h),data=img.data;
   for(var y=0;y<h;y++){
     for(var x=0;x<w;x++){
-      var dx=x-cx,dy=y-cy;
-      var dist=Math.sqrt(dx*dx+dy*dy);
+      var dx=x-cx,dy=y-cy,dist=Math.sqrt(dx*dx+dy*dy);
       if(dist>r)continue;
-      var angle=Math.atan2(dy,dx);
-      var hue=((angle*180/Math.PI)+360)%360;
-      var sat=dist/r;
-      var rgb=hslToRgb(hue,sat,0.5);
-      var idx=(y*w+x)*4;
+      var angle=Math.atan2(dy,dx),hue=((angle*180/Math.PI)+360)%360,sat=dist/r;
+      var rgb=hslToRgb(hue,sat,0.5),idx=(y*w+x)*4;
       data[idx]=rgb[0];data[idx+1]=rgb[1];data[idx+2]=rgb[2];data[idx+3]=255;
     }
   }
   ctx.putImageData(img,0,0);
 }
-
 function updateWheelDot(){
-  var canvas=$("picker-wheel");
-  var dot=$("picker-wheel-dot");
-  var r=canvas.width/2-1;
-  var rad=pickerState.hue*Math.PI/180;
-  var dist=pickerState.sat*r;
-  var cx=canvas.width/2+Math.cos(rad)*dist;
-  var cy=canvas.height/2+Math.sin(rad)*dist;
-  dot.style.left=cx+"px";
-  dot.style.top=cy+"px";
+  var canvas=$("picker-wheel"),dot=$("picker-wheel-dot"),r=canvas.width/2-1;
+  var rad=pickerState.hue*Math.PI/180,dist=pickerState.sat*r;
+  dot.style.left=(canvas.width/2+Math.cos(rad)*dist)+"px";
+  dot.style.top=(canvas.height/2+Math.sin(rad)*dist)+"px";
   dot.style.background=pickerState.color;
 }
-
 function updatePickerPreview(){
   $("picker-preview").style.background=pickerState.color;
   $("picker-hex").value=pickerState.color;
@@ -1187,219 +1032,129 @@ function updatePickerPreview(){
     b.classList.toggle("on",b.dataset.color.toLowerCase()===pickerState.color.toLowerCase());
   });
 }
-
 function setPickerColor(hex,fromWheel){
-  hex=hex.toLowerCase();
-  if(!/^#[0-9a-f]{6}$/.test(hex))return;
+  hex=hex.toLowerCase();if(!/^#[0-9a-f]{6}$/.test(hex))return;
   pickerState.color=hex;
   if(!fromWheel){
     var hsl=rgbToHsl(hex);
-    pickerState.hue=hsl.h;
-    pickerState.sat=hsl.s;
-    pickerState.light=Math.round(hsl.l*100);
+    pickerState.hue=hsl.h;pickerState.sat=hsl.s;pickerState.light=Math.round(hsl.l*100);
   }
   updatePickerPreview();
 }
-
 function setColorFromWheelEvent(e){
-  var canvas=$("picker-wheel");
-  var rect=canvas.getBoundingClientRect();
-  var clientX=e.touches?e.touches[0].clientX:e.clientX;
-  var clientY=e.touches?e.touches[0].clientY:e.clientY;
-  var x=(clientX-rect.left)*(canvas.width/rect.width);
-  var y=(clientY-rect.top)*(canvas.height/rect.height);
-  var cx=canvas.width/2,cy=canvas.height/2;
-  var dx=x-cx,dy=y-cy;
-  var r=canvas.width/2-1;
-  var dist=Math.min(Math.sqrt(dx*dx+dy*dy),r);
-  var hue=((Math.atan2(dy,dx)*180/Math.PI)+360)%360;
-  var sat=dist/r;
-  pickerState.hue=hue;
-  pickerState.sat=sat;
+  var canvas=$("picker-wheel"),rect=canvas.getBoundingClientRect();
+  var clientX=e.touches?e.touches[0].clientX:e.clientX,clientY=e.touches?e.touches[0].clientY:e.clientY;
+  var x=(clientX-rect.left)*(canvas.width/rect.width),y=(clientY-rect.top)*(canvas.height/rect.height);
+  var cx=canvas.width/2,cy=canvas.height/2,dx=x-cx,dy=y-cy,r=canvas.width/2-1;
+  var dist=Math.min(Math.sqrt(dx*dx+dy*dy),r),hue=((Math.atan2(dy,dx)*180/Math.PI)+360)%360,sat=dist/r;
+  pickerState.hue=hue;pickerState.sat=sat;
   pickerState.color=hslToHex(hue,sat*100,pickerState.light);
   updatePickerPreview();
 }
-
 function openColorPicker(initial,count,onPick,title){
-  pickerState.paletteCount=count;
-  pickerState.onPick=onPick;
-  pickerState.open=true;
+  pickerState.paletteCount=count;pickerState.onPick=onPick;pickerState.open=true;
   $("picker-title").textContent=title||"选择颜色";
-  // 生成色板
-  var grid=$("picker-grid");
-  grid.className="picker-grid "+(count===32?"g32":"g16");
-  var colors=buildPalette(count);
+  var grid=$("picker-grid");grid.className="picker-grid "+(count===32?"g32":"g16");
   grid.innerHTML="";
-  colors.forEach(function(c){
+  buildPalette(count).forEach(function(c){
     var b=document.createElement("button");
-    b.type="button";
-    b.style.background=c;
-    b.dataset.color=c;
+    b.type="button";b.style.background=c;b.dataset.color=c;
     b.addEventListener("click",function(){setPickerColor(c,false)});
     grid.appendChild(b);
   });
-  // 初始化状态
   setPickerColor(initial,false);
-  // 混色初始值
-  pickerState.mixA=initial;
-  pickerState.mixB="#ffffff";
-  $("mix-a").value=initial;
-  $("mix-b").value="#ffffff";
-  $("mix-ratio").value=50;
-  updateMixResult();
-  // 绘制色轮（一次即可）
-  drawWheel();
-  updatePickerPreview();
-  $("picker-overlay").classList.add("open");
-  document.body.style.overflow="hidden";
+  pickerState.mixA=initial;pickerState.mixB="#ffffff";
+  $("mix-a").value=initial;$("mix-b").value="#ffffff";$("mix-ratio").value=50;
+  updateMixResult();drawWheel();updatePickerPreview();
+  $("picker-overlay").classList.add("open");document.body.style.overflow="hidden";
 }
-
 function closeColorPicker(){
-  pickerState.open=false;
-  $("picker-overlay").classList.remove("open");
-  if(!$("settings-drawer").classList.contains("open")){
-    document.body.style.overflow="";
-  }
+  pickerState.open=false;$("picker-overlay").classList.remove("open");
+  if(!$("settings-drawer").classList.contains("open"))document.body.style.overflow="";
 }
-
 function updateMixResult(){
-  var a=$("mix-a").value,b=$("mix-b").value;
-  var t=parseInt($("mix-ratio").value,10)/100;
+  var a=$("mix-a").value,b=$("mix-b").value,t=parseInt($("mix-ratio").value,10)/100;
   var c=mixColor(a,b,t);
-  $("mix-result").style.background=c;
-  $("mix-result").dataset.color=c;
+  $("mix-result").style.background=c;$("mix-result").dataset.color=c;
   pickerState.mixA=a;pickerState.mixB=b;
 }
 
-/* ============================================================
- * 设置项绑定
- * ============================================================ */
 function bindSettings(){
   $("btn-settings").addEventListener("click",openSettings);
   $("btn-settings-close").addEventListener("click",closeSettings);
   $("settings-backdrop").addEventListener("click",closeSettings);
-
-  // 主题模式
   Array.prototype.forEach.call(document.querySelectorAll("#theme-mode button"),function(b){
     b.addEventListener("click",function(){
-      settings.theme.mode=b.dataset.mode;
-      saveSettings(settings);
-      applyTheme();
-      syncSettingsUI();
+      settings.theme.mode=b.dataset.mode;saveSettings(settings);
+      applyTheme();syncSettingsUI();
     });
   });
-
-  // 自定义主题色块
   Array.prototype.forEach.call(document.querySelectorAll("[data-theme-key]"),function(sw){
     sw.addEventListener("click",function(){
-      var key=sw.dataset.themeKey;
-      var cur=settings.customTheme[key];
+      var key=sw.dataset.themeKey,cur=settings.customTheme[key];
       openColorPicker(cur,32,function(color){
-        settings.customTheme[key]=color;
-        saveSettings(settings);
-        applyTheme();
-        syncSettingsUI();
+        settings.customTheme[key]=color;saveSettings(settings);
+        applyTheme();syncSettingsUI();
       },"主题 · "+({bg:"背景色",card:"卡片色",text:"文字色",primary:"主色调"}[key]||key));
     });
   });
-
   $("btn-theme-reset").addEventListener("click",function(){
     settings.customTheme=Object.assign({},DEFAULT_SETTINGS.customTheme);
-    saveSettings(settings);
-    applyTheme();
-    syncSettingsUI();
+    saveSettings(settings);applyTheme();syncSettingsUI();
   });
-
-  // 字体
   $("font-select").addEventListener("change",function(){
     settings.font.familyIndex=parseInt(this.value,10)||0;
-    saveSettings(settings);
-    applyFont();
+    saveSettings(settings);applyFont();
   });
   $("font-size").addEventListener("input",function(){
     settings.font.size=parseInt(this.value,10)||16;
     $("font-size-val").textContent=settings.font.size;
-    saveSettings(settings);
-    applyFont();
+    saveSettings(settings);applyFont();
   });
   $("font-color-swatch").addEventListener("click",function(){
     openColorPicker(settings.font.color,16,function(color){
-      settings.font.color=color;
-      saveSettings(settings);
-      applyFont();
-      syncSettingsUI();
+      settings.font.color=color;saveSettings(settings);
+      applyFont();syncSettingsUI();
     },"字体颜色");
   });
-
-  // 数据目录
   $("btn-change-dir").addEventListener("click",async function(){
     var cur=$("data-dir-current").textContent.trim();
-    var path=window.prompt(
-      "请输入新的数据目录（绝对路径）：\n例如 Windows: D:\\GuessNumberData\n例如 Linux/macOS: /home/user/guess_data",
-      cur
-    );
-    if(path===null)return;
-    path=path.trim();
+    var path=window.prompt("请输入新的数据目录（绝对路径）：",cur);
     if(!path)return;
     try{
       var res=await fetch("/api/config/data_dir",{
-        method:"POST",
-        headers:{"Content-Type":"application/json"},
-        body:JSON.stringify({path:path})
+        method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({path:path})
       });
       var d=await res.json();
       if(!res.ok)throw new Error(d.error||"更改失败");
       $("data-dir-current").textContent=d.data_dir;
       alert(d.migrated?"数据目录已更改，记录已迁移。":"数据目录已更改。");
-    }catch(e){
-      alert("更改失败："+e.message);
-    }
+    }catch(e){alert("更改失败："+e.message)}
   });
 }
 
-/* ============================================================
- * 颜色选择器事件
- * ============================================================ */
 function bindPicker(){
   $("picker-close").addEventListener("click",closeColorPicker);
   $("picker-cancel").addEventListener("click",closeColorPicker);
-  $("picker-overlay").addEventListener("click",function(e){
-    if(e.target===this)closeColorPicker();
-  });
-
+  $("picker-overlay").addEventListener("click",function(e){if(e.target===this)closeColorPicker()});
   $("picker-ok").addEventListener("click",function(){
-    if(typeof pickerState.onPick==="function"){
-      pickerState.onPick(pickerState.color);
-    }
+    if(typeof pickerState.onPick==="function")pickerState.onPick(pickerState.color);
     closeColorPicker();
   });
-
   $("picker-light").addEventListener("input",function(){
     pickerState.light=parseInt(this.value,10);
     pickerState.color=hslToHex(pickerState.hue,pickerState.sat*100,pickerState.light);
     updatePickerPreview();
   });
-
   $("picker-hex").addEventListener("change",function(){
     var v=this.value.trim();
     if(/^[0-9a-f]{6}$/i.test(v))v="#"+v;
     if(/^#[0-9a-f]{6}$/i.test(v))setPickerColor(v.toLowerCase(),false);
     else updatePickerPreview();
   });
-
-  // 色轮交互
-  var wheel=$("picker-wheel");
-  var dragging=false;
-  function onDown(e){
-    dragging=true;
-    setColorFromWheelEvent(e);
-    e.preventDefault();
-  }
-  function onMove(e){
-    if(!dragging)return;
-    setColorFromWheelEvent(e);
-    e.preventDefault();
-  }
+  var wheel=$("picker-wheel"),dragging=false;
+  function onDown(e){dragging=true;setColorFromWheelEvent(e);e.preventDefault()}
+  function onMove(e){if(dragging){setColorFromWheelEvent(e);e.preventDefault()}}
   function onUp(){dragging=false}
   wheel.addEventListener("mousedown",onDown);
   wheel.addEventListener("touchstart",onDown,{passive:false});
@@ -1407,8 +1162,6 @@ function bindPicker(){
   window.addEventListener("touchmove",onMove,{passive:false});
   window.addEventListener("mouseup",onUp);
   window.addEventListener("touchend",onUp);
-
-  // 混色
   $("mix-a").addEventListener("input",updateMixResult);
   $("mix-b").addEventListener("input",updateMixResult);
   $("mix-ratio").addEventListener("input",updateMixResult);
@@ -1418,10 +1171,7 @@ function bindPicker(){
   });
 }
 
-/* ============================================================
- * 游戏逻辑（沿用原版）
- * ============================================================ */
-var state={view:"menu",game:null,lastLevel:null,lastExtra:null,historyPage:1};
+var state={view:"menu",game:null,lastLevel:null,lastExtra:null,historyPage:1,selectedIndices:new Set()};
 
 function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,function(c){
   return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]})}
@@ -1482,8 +1232,7 @@ function renderGame(){
   show($("btn-again"),!!g.finished);
 }
 
-function setFeedback(t,c){var e=$("g-feedback");e.textContent=t;
-  e.className="feedback"+(c?" "+c:"")}
+function setFeedback(t,c){var e=$("g-feedback");e.textContent=t;e.className="feedback"+(c?" "+c:"")}
 
 async function submitGuess(raw){
   var g=state.game;if(!g||g.finished)return;
@@ -1523,17 +1272,32 @@ async function loadHistory(page){
     $("h-info").textContent="第 "+d.page+" / "+d.pages+" 页 · 共 "+d.total+" 条";
     $("h-prev").disabled=d.page<=1;$("h-next").disabled=d.page>=d.pages;
     if(!d.items.length){box.innerHTML='<p class="muted">暂无记录</p>';return}
-    box.innerHTML=d.items.map(function(r){
+    
+    box.innerHTML=d.items.map(function(r, index){
       var gs=(r.guesses&&r.guesses.length)?r.guesses.join(" → "):"无";
+      var globalIndex = (d.page - 1) * 10 + index;
+      var isChecked = state.selectedIndices.has(globalIndex) ? "checked" : "";
+      
       return '<div class="list-item '+(r.win?"win":"lose")+'">'+
+        '<input type="checkbox" data-idx="'+globalIndex+'" ' + isChecked + '>' +
+        '<div class="li-content">'+
         '<div class="li-head"><span class="tag '+(r.win?"ok":"bad")+'">'+
         (r.win?"猜对":"失败")+'</span><span class="muted small">#'+r.no+" · "+esc(r.time)+"</span></div>"+
         '<div class="li-row"><span>难度</span><b>'+esc(r.level_name)+"</b></div>"+
         '<div class="li-row"><span>答案</span><b>'+esc(r.answer)+"</b></div>"+
         '<div class="li-row"><span>使用次数</span><b>'+esc(r.attempts)+" / "+esc(r.max_attempts)+"</b></div>"+
         (r.percent?'<div class="li-row"><span>使用次数百分比</span><b>'+esc(r.percent)+"</b></div>":"")+
-        '<div class="li-row"><span>猜测序列</span><b class="mono">'+esc(gs)+"</b></div></div>"
+        '<div class="li-row"><span>猜测序列</span><b class="mono">'+esc(gs)+"</b></div></div></div>"
     }).join("");
+
+    Array.prototype.forEach.call(box.querySelectorAll("input[type=checkbox]"), function(cb){
+      cb.addEventListener("change", function(){
+        var idx = parseInt(this.dataset.idx, 10);
+        if(this.checked) state.selectedIndices.add(idx);
+        else state.selectedIndices.delete(idx);
+      });
+    });
+
   }catch(e){box.innerHTML='<p class="feedback lose">加载失败：'+esc(e.message)+"</p>"}
 }
 
@@ -1570,8 +1334,7 @@ function bindGame(){
   Array.prototype.forEach.call(document.querySelectorAll(".level"),function(b){
     b.addEventListener("click",function(){
       var lv=b.dataset.level;
-      if(lv==="4"){show($("custom-card"),true);updateCustomHint();
-        try{$("in-max").focus()}catch(e){}}
+      if(lv==="4"){show($("custom-card"),true);updateCustomHint();try{$("in-max").focus()}catch(e){}}
       else{show($("custom-card"),false);startGame(lv)}
     })});
   $("in-max").addEventListener("input",updateCustomHint);
@@ -1582,35 +1345,72 @@ function bindGame(){
     if(!isFinite(att)||att<1){alert("猜测次数至少为 1");return}
     startGame("4",{max_num:maxN,max_attempts:att});
   });
-  $("guess-form").addEventListener("submit",function(e){
-    e.preventDefault();submitGuess($("guess-input").value)});
-  $("btn-again").addEventListener("click",function(){
-    if(state.lastLevel)startGame(state.lastLevel,state.lastExtra)});
-  $("btn-menu").addEventListener("click",function(){
-    state.game=null;setView("menu");setStatus("就绪")});
+  $("guess-form").addEventListener("submit",function(e){e.preventDefault();submitGuess($("guess-input").value)});
+  $("btn-again").addEventListener("click",function(){if(state.lastLevel)startGame(state.lastLevel,state.lastExtra)});
+  $("btn-menu").addEventListener("click",function(){state.game=null;setView("menu");setStatus("就绪")});
   Array.prototype.forEach.call(document.querySelectorAll(".tab"),function(t){
     t.addEventListener("click",function(){
-      var v=t.dataset.view;
-      setView(v==="menu"?(state.game?"game":"menu"):v)})});
-  $("h-prev").addEventListener("click",function(){
-    if(state.historyPage>1)loadHistory(state.historyPage-1)});
+      var v=t.dataset.view;setView(v==="menu"?(state.game?"game":"menu"):v)})});
+  $("h-prev").addEventListener("click",function(){if(state.historyPage>1)loadHistory(state.historyPage-1)});
   $("h-next").addEventListener("click",function(){loadHistory(state.historyPage+1)});
+  
+  $("btn-select-all").addEventListener("click", function(){
+    Array.prototype.forEach.call(document.querySelectorAll("#history-list input[type=checkbox]"), function(cb){
+      cb.checked = true;
+      state.selectedIndices.add(parseInt(cb.dataset.idx, 10));
+    });
+  });
+  $("btn-unselect-all").addEventListener("click", function(){
+    state.selectedIndices.clear();
+    Array.prototype.forEach.call(document.querySelectorAll("#history-list input[type=checkbox]"), function(cb){
+      cb.checked = false;
+    });
+  });
+
   Array.prototype.forEach.call(document.querySelectorAll("[data-export]"),function(b){
-    b.addEventListener("click",function(){
+    b.addEventListener("click",async function(){
       var fmt=b.dataset.export,scope=$("ex-scope").value;
       setStatus("正在导出…");
-      window.location.href="/api/export?fmt="+encodeURIComponent(fmt)+
-                           "&scope="+encodeURIComponent(scope);
-      setTimeout(function(){setStatus("就绪")},1500);
-    })});
+      
+      if (scope === "selected") {
+        if (state.selectedIndices.size === 0) {
+          alert("您还没有勾选任何记录，请先在“历史”页面勾选。");
+          setStatus("就绪");
+          return;
+        }
+        try {
+          var res = await fetch("/api/export", {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({ fmt: fmt, indices: Array.from(state.selectedIndices) })
+          });
+          if (!res.ok) {
+            var err = await res.json();
+            throw new Error(err.error || "导出失败");
+          }
+          var blob = await res.blob();
+          var url = window.URL.createObjectURL(blob);
+          var a = document.createElement("a");
+          a.href = url;
+          a.download = "guess_records_selected_" + new Date().getTime() + "." + fmt;
+          document.body.appendChild(a);
+          a.click();
+          a.remove();
+          window.URL.revokeObjectURL(url);
+        } catch(e) {
+          alert("导出失败：" + e.message);
+        }
+        setStatus("就绪");
+      } else {
+        window.location.href="/api/export?fmt="+encodeURIComponent(fmt)+"&scope="+encodeURIComponent(scope);
+        setTimeout(function(){setStatus("就绪")},1500);
+      }
+    });
+  });
 }
 
-/* ============================================================
- * 初始化
- * ============================================================ */
 function initFontSelect(){
-  var sel=$("font-select");
-  sel.innerHTML="";
+  var sel=$("font-select");sel.innerHTML="";
   FONTS.forEach(function(f,i){
     var opt=document.createElement("option");
     opt.value=String(i);opt.textContent=f.name;
@@ -1619,14 +1419,8 @@ function initFontSelect(){
 }
 
 function init(){
-  initFontSelect();
-  applyAll();
-  bindGame();
-  bindSettings();
-  bindPicker();
-  setView("menu");
-  setStatus("就绪");
-  loadDataDirInfo();
+  initFontSelect();applyAll();bindGame();bindSettings();bindPicker();
+  setView("menu");setStatus("就绪");loadDataDirInfo();
 }
 if(document.readyState==="loading")document.addEventListener("DOMContentLoaded",init);
 else init();
@@ -1636,18 +1430,19 @@ else init();
 </html>
 """
 
+HTML_PAGE = HTML_PAGE.replace("%FAVICON%", FAVICON_B64)
 
-# ============================================================
-# HTTP 服务
-# ============================================================
+
+# ==============================================================================
+# 模块：HTTP 服务端路由 (HTTP Server Router)
+# ==============================================================================
+
 class Handler(BaseHTTPRequestHandler):
-    server_version = "GuessNumberPro/1.1"
-
+    server_version = "GuessNumberPro/1.5"
+    
     def log_message(self, fmt, *args):
-        # 关闭访问日志，避免控制台刷屏
         pass
 
-    # ---------- 输出工具 ----------
     def _send(self, code, body, ctype="application/json; charset=utf-8", extra_headers=None):
         if isinstance(body, str):
             body = body.encode("utf-8")
@@ -1680,7 +1475,6 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             raise ValueError("请求格式错误")
 
-    # ---------- GET ----------
     def do_GET(self):
         u = urlparse(self.path)
         q = parse_qs(u.query)
@@ -1705,7 +1499,7 @@ class Handler(BaseHTTPRequestHandler):
                 })
 
             elif u.path == "/api/export":
-                self._handle_export(q)
+                self._handle_export_get(q)
 
             else:
                 self._json(404, {"error": "未找到"})
@@ -1714,7 +1508,6 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:
             self._json(500, {"error": "服务器错误：" + str(e)})
 
-    # ---------- POST ----------
     def do_POST(self):
         u = urlparse(self.path)
         try:
@@ -1738,6 +1531,30 @@ class Handler(BaseHTTPRequestHandler):
                 result = change_data_dir(path)
                 self._json(200, result)
 
+            elif u.path == "/api/export":
+                payload = self._read_json()
+                fmt = payload.get("fmt", "csv").lower()
+                indices = payload.get("indices", [])
+                
+                records = list(reversed(load_records()))
+                selected = [records[i] for i in indices if 0 <= i < len(records)]
+                if not selected:
+                    raise ValueError("未找到勾选的记录")
+
+                stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                if fmt == "html":
+                    body = export_html(selected).encode("utf-8")
+                    fname = f"guess_records_selected_{stamp}.html"
+                    ctype = "text/html; charset=utf-8"
+                else:
+                    body = export_csv(selected).encode("utf-8-sig")
+                    fname = f"guess_records_selected_{stamp}.csv"
+                    ctype = "text/csv; charset=utf-8"
+
+                self._send(200, body, ctype, {
+                    "Content-Disposition": f'attachment; filename="{fname}"'
+                })
+
             else:
                 self._json(404, {"error": "未找到"})
         except KeyError as e:
@@ -1747,8 +1564,7 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:
             self._json(500, {"error": "服务器错误：" + str(e)})
 
-    # ---------- 导出 ----------
-    def _handle_export(self, q):
+    def _handle_export_get(self, q):
         fmt = q.get("fmt", ["csv"])[0].lower()
         scope = q.get("scope", ["all"])[0]
         records = load_records()
@@ -1776,24 +1592,73 @@ class Handler(BaseHTTPRequestHandler):
             fname = f"guess_records_{scope}_{stamp}.csv"
             ctype = "text/csv; charset=utf-8"
 
-        self.send_response(200)
-        self.send_header("Content-Type", ctype)
-        self.send_header(
-            "Content-Disposition",
-            f'attachment; filename="{fname}"',
-        )
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
+        self._send(200, body, ctype, {
+            "Content-Disposition": f'attachment; filename="{fname}"'
+        })
+
+
+# ==============================================================================
+# 模块：内网穿透 (Tunneling) & 启动 (Bootstrapping)
+# ==============================================================================
+
+def start_tunnel(port):
+    """
+    启动内置的 SSH 隧道，并增加详细的错误捕获与超时提示。
+    """
+    def run():
+        cmd = [
+            "ssh", "-p", "443", "-o", "StrictHostKeyChecking=no",
+            "-o", "UserKnownHostsFile=NUL",
+            "-R0:localhost:" + str(port), "a.pinggy.io"
+        ]
         try:
-            self.wfile.write(body)
-        except (BrokenPipeError, ConnectionResetError):
-            pass
+            creationflags = 0x08000000 if os.name == 'nt' else 0
+            
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="ignore",
+                bufsize=1,
+                creationflags=creationflags
+            )
+            
+            url_found = False
+            start_time = time.time()
+            
+            for line in process.stdout:
+                # 调试时可以取消下面这行的注释查看原始 ssh 输出
+                # print("SSH_LOG:", line.strip())
+                
+                match = re.search(r'(https://[a-zA-Z0-9.-]+\.pinggy\.link)', line)
+                if match:
+                    url = match.group(1)
+                    print(f"\n  🌍 【公网访问地址】成功获取!")
+                    print(f"  👉 {url}")
+                    print(f"  👉 把这个网址发给朋友，他们不在同一个 Wi-Fi 也能玩！\n")
+                    url_found = True
+                    break
+                
+                # 超时机制防止卡死
+                if time.time() - start_time > 15:
+                    break
 
+            if not url_found:
+                print("\n  ⚠️ 获取外网链接超时或失败。")
+                print("  可能原因：1. 网络无法连接 pinggy.io；2. 防火墙拦截了 SSH。")
+                print("  你可以继续使用局域网 IP 游玩。")
+                
+        except FileNotFoundError:
+            print("\n  ⚠️ 未检测到系统 ssh 命令（Windows 10+ 默认自带）。")
+            print("  请确保 C:\\Windows\\System32\\OpenSSH\\ssh.exe 存在。")
+        except Exception as e:
+            print(f"\n  ⚠️ 穿透启动失败：{e}")
 
-# ============================================================
-# 启动
-# ============================================================
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+
 def get_lan_ip() -> str:
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
@@ -1803,7 +1668,6 @@ def get_lan_ip() -> str:
         return "127.0.0.1"
     finally:
         s.close()
-
 
 def find_port(start: int = 8000, tries: int = 30) -> int:
     for port in range(start, start + tries):
@@ -1815,7 +1679,6 @@ def find_port(start: int = 8000, tries: int = 30) -> int:
             except OSError:
                 continue
     raise RuntimeError("找不到可用端口")
-
 
 def main() -> None:
     try:
@@ -1838,15 +1701,17 @@ def main() -> None:
     print("=" * 60)
     print("  GuessNumberPro · 猜数字游戏（Web 版）")
     print("=" * 60)
-    print(f"  电脑访问：  http://127.0.0.1:{port}")
-    print(f"  手机访问：  http://{lan_ip}:{port}")
-    print(f"  数据目录：  {get_data_dir()}")
-    print(f"  配置文件：  {CONFIG_FILE}")
+    print(f"  电脑本地访问：  http://127.0.0.1:{port}")
+    print(f"  局域网手机访问：http://{lan_ip}:{port}")
+    print(f"  数据目录：      {get_data_dir()}")
     print()
     print("  ⚠ 手机需和电脑连在同一个 Wi-Fi 下")
-    print("  ⚠ 首次运行如弹防火墙提示，请点【允许访问】")
-    print("  💡 页面左下角齿轮图标可打开设置")
-    print("  💡 设置里可更换主题、字体、数据目录")
+    print("  💡 历史页支持勾选记录后单独导出")
+    print("  🌍 正在尝试获取外网链接，请稍等（最多 15 秒）...")
+    
+    start_tunnel(port)
+
+    print("=" * 60)
     print("  按 Ctrl+C 退出")
     print("=" * 60)
 
@@ -1865,7 +1730,6 @@ def main() -> None:
             httpd.server_close()
         except Exception:
             pass
-
 
 if __name__ == "__main__":
     main()
